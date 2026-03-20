@@ -1,11 +1,11 @@
-# OpenClaw + Cloudflare Tunnel Privacy Deployment Script
+# Deploy OpenClaw behind Cloudflare Zero Trust
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Platform: Cross-platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux-999999.svg)]()
 [![Privacy: Enhanced](https://img.shields.io/badge/Privacy-Enhanced-green.svg)](https://github.com/Peters-Pans/deploy-openclaw)
 
-> Securely deploy OpenClaw behind Cloudflare Tunnel — no public IP, no port forwarding, no hassle.  
-> **Cross-platform (macOS + Linux) | IPv4 dynamic-friendly | Real IP fully hidden**
+> **Private, portless, works anywhere.**  
+> No public IP, no port forwarding, no hassle. Cross-platform (macOS + Linux).
 
 [中文文档](README.zh.md)
 

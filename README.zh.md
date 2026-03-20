@@ -1,11 +1,7 @@
-# OpenClaw + Cloudflare Tunnel 隐私部署脚本
+# 私有化部署 OpenClaw — Cloudflare Zero Trust
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Platform: Cross-platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux-999999.svg)]()
-[![Privacy: Enhanced](https://img.shields.io/badge/Privacy-Enhanced-green.svg)](https://github.com/Peters-Pans/deploy-openclaw)
-
-> 🦞 安全部署 OpenClaw + Cloudflare Tunnel，适配中国大陆动态 IPv4 环境  
-> **跨平台 (macOS + Linux) | 无需公网 IP | 无需端口转发 | 无需备案**
+> **无公网 IP | 零端口暴露 | 跨平台 (macOS + Linux)**  
+> 🦞 适配中国大陆动态 IPv4，免备案，一键部署
 
 [English](README.md)
 
