@@ -31,7 +31,9 @@ LOG_FILE=""
 # ========== 版本比较（纯 bash，不依赖 sort -V）==========
 version_gte() {
     local IFS='.'
-    local -a aa=($1) bb=($2)
+    local aa bb
+    read -ra aa <<< "$1"
+    read -ra bb <<< "$2"
     for i in 0 1 2; do
         local a="${aa[$i]:-0}" b="${bb[$i]:-0}"
         [ "$a" -gt "$b" ] && return 0
@@ -75,15 +77,15 @@ generate_secure_token() {
 oc_config_set() {
     local key="$1" value="$2"
     if [ "$key" = "gateway.auth.token" ]; then
-        # 写入临时文件（权限 600），通过 cat 传入
         local tmpf
         tmpf=$(mktemp) || error "无法创建临时文件"
+        # trap 保证无论成功失败都清理
+        trap 'rm -f "$tmpf"' RETURN
         chmod 600 "$tmpf"
         echo -n "$value" > "$tmpf"
+        # 尝试 --file，不支持则报错退出（不再有 ps 可见的 fallback）
         openclaw config set "$key" --file "$tmpf" >> "$LOG_FILE" 2>&1 || \
-            # --file 不支持时的 fallback：通过 stdin
-            openclaw config set "$key" "$(cat "$tmpf")" >> "$LOG_FILE" 2>&1
-        rm -f "$tmpf"
+            error "openclaw config set 不支持 --file，请升级 OpenClaw"
     else
         openclaw config set "$key" "$value" >> "$LOG_FILE" 2>&1
     fi
@@ -102,20 +104,153 @@ json_field() {
 }
 
 # 屏蔽 set -x 对敏感命令的输出（防止 Token 进日志）
-# 用法: _quiet curl ... ; _quiet_end
-_quiet_save=""
-_quiet() {
-    if [[ "$-" == *x* ]]; then
-        _quiet_save="x"
-        set +x
+# 用法: ( _safe; curl ... ; )
+# 在 subshell 里 set +x，不影响父 shell
+_safe() { set +x 2>/dev/null; }
+
+# ========== 国际化 ==========
+
+# 自动检测语言或通过 --lang 指定
+# 支持: zh (中文，默认), en (English)
+LANG_CODE="${LANG_CODE:-}"
+if [ -z "$LANG_CODE" ]; then
+    case "${LANG:-${LC_ALL:-}}" in
+        en*|C|POSIX) LANG_CODE="en" ;;
+        *) LANG_CODE="zh" ;;
+    esac
+fi
+
+_t() {
+    local key="$1"
+    if [ "$LANG_CODE" = "en" ]; then
+        case "$key" in
+            checking_deps) echo "Checking dependencies..." ;;
+            system_info) echo "System: $OS_NAME $OS_VERSION ($OS_FAMILY) | Pkg: $PKG_MANAGER" ;;
+            installing) echo "Installing $1..." ;;
+            installed) echo "✓ $1 installed" ;;
+            already_installed) echo "✓ $1 already installed" ;;
+            update_prompt) echo "Update to latest? (y/n): " ;;
+            homebrew_needed) echo "Homebrew required" ;;
+            sudo_needed) echo "sudo required for Linux deployment" ;;
+            os_version_warn) echo "⚠️  macOS 11.0+ recommended" ;;
+            config_wizard) echo "===== Configuration =====" ;;
+            domain_prompt) echo "▶ Domain (e.g. claw.example.com): " ;;
+            port_prompt) echo "▶ Port (default $DEFAULT_PORT): " ;;
+            enter_continue) echo "Press Enter to continue..." ;;
+            token_saved) echo "✓ Token → $OC_CONFIG_DIR/.auth_token (600)" ;;
+            using_env_token) echo "Using OPENCLAW_TOKEN from environment" ;;
+            config_written) echo "✓ Config written" ;;
+            config_valid) echo "✓ Config validated" ;;
+            starting) echo "Starting $1..." ;;
+            start_failed) echo "Failed to start $1" ;;
+            running) echo "✓ Running (127.0.0.1:$PORT)" ;;
+            not_listening) echo "Not listening on 127.0.0.1:$PORT" ;;
+            cf_auth_needed) echo "⚠️  Cloudflare authentication required" ;;
+            cf_auth_done) echo "✓ Authenticated" ;;
+            cf_auth_exists) echo "✓ Existing auth credentials found" ;;
+            reusing_tunnel) echo "⚠️  Reusing tunnel: $1" ;;
+            tunnel_created) echo "✓ Tunnel created: $1" ;;
+            cred_missing) echo "Credential file missing. Delete old tunnel first: cloudflared tunnel delete $TUNNEL_NAME" ;;
+            tunnel_config_done) echo "✓ Tunnel config generated" ;;
+            dns_already) echo "⚠️  DNS record already exists" ;;
+            dns_done) echo "✓ DNS route configured" ;;
+            dns_failed) echo "⚠️  DNS route failed" ;;
+            skip_access) echo "Skipping CF Access (--no-access)" ;;
+            cf_access_title) echo "===== Cloudflare Access =====" ;;
+            team_name_prompt) echo "▶ Zero Trust Team Name (e.g. myteam): " ;;
+            email_prompt) echo "▶ Allowed email: " ;;
+            creating_app) echo "Creating Access Application..." ;;
+            app_created) echo "✓ Application created" ;;
+            app_failed) echo "Cannot create Access Application" ;;
+            policy_created) echo "✓ Policy created" ;;
+            jwt_enabled) echo "✓ Origin JWT verification enabled" ;;
+            verifying) echo "===== Deployment Verification =====" ;;
+            openclaw_check) echo "OpenClaw listening..." ;;
+            tunnel_check) echo "Tunnel process..." ;;
+            tunnel_healthy) echo "✓ Tunnel connected" ;;
+            tunnel_not_healthy) echo "⚠️  Tunnel process running but not yet connected" ;;
+            tunnel_not_found) echo "⚠️  No tunnel process detected" ;;
+            domain_check) echo "Domain reachable..." ;;
+            deploy_ok) echo "✅ Deployment verified" ;;
+            deploy_partial) echo "⚠️  Some checks failed" ;;
+            uninstall_title) echo "===== Uninstall =====" ;;
+            confirm_uninstall) echo "Confirm uninstall? (y/n): " ;;
+            uninstall_oc) echo "Uninstall OpenClaw CLI? (y/n): " ;;
+            uninstall_tunnel) echo "Delete Cloudflare Tunnel? (y/n): " ;;
+            uninstall_dns) echo "Delete CF DNS record? (y/n): " ;;
+            tunnel_delete_failed) echo "⚠️  Tunnel delete failed, keeping ~/.cloudflared" ;;
+            no_domain_skip) echo "⚠️  No domain specified, skipping DNS deletion" ;;
+            uninstall_done) echo "✅ Uninstall complete" ;;
+            deploy_success) echo "✅ Deployment complete!" ;;
+            unknown_arg) echo "Unknown argument: $1" ;;
+            *) echo "$key" ;;
+        esac
+    else
+        case "$key" in
+            checking_deps) echo "检查依赖..." ;;
+            system_info) echo "系统: $OS_NAME $OS_VERSION ($OS_FAMILY) | 包管理: $PKG_MANAGER" ;;
+            installing) echo "安装 $1..." ;;
+            installed) echo "✓ $1 安装成功" ;;
+            already_installed) echo "✓ $1 已安装" ;;
+            update_prompt) echo "更新到最新版? (y/n): " ;;
+            homebrew_needed) echo "需要 Homebrew" ;;
+            sudo_needed) echo "Linux 部署需要 sudo" ;;
+            os_version_warn) echo "⚠️  建议 macOS 11.0+" ;;
+            config_wizard) echo "===== 配置向导 =====" ;;
+            domain_prompt) echo "▶ 域名 (如 claw.example.com): " ;;
+            port_prompt) echo "▶ 端口 (默认 $DEFAULT_PORT): " ;;
+            enter_continue) echo "按 Enter 继续..." ;;
+            token_saved) echo "✓ Token → $OC_CONFIG_DIR/.auth_token (600)" ;;
+            using_env_token) echo "使用环境变量 OPENCLAW_TOKEN" ;;
+            config_written) echo "✓ 配置已写入" ;;
+            config_valid) echo "✓ 配置验证通过" ;;
+            starting) echo "启动 $1..." ;;
+            start_failed) echo "$1 启动失败" ;;
+            running) echo "✓ 运行中 (127.0.0.1:$PORT)" ;;
+            not_listening) echo "未正确监听 127.0.0.1:$PORT" ;;
+            cf_auth_needed) echo "⚠️  需要完成 Cloudflare 认证" ;;
+            cf_auth_done) echo "✓ 认证成功" ;;
+            cf_auth_exists) echo "✓ 已有认证凭据" ;;
+            reusing_tunnel) echo "⚠️  复用隧道: $1" ;;
+            tunnel_created) echo "✓ 隧道创建: $1" ;;
+            cred_missing) echo "凭据文件不存在。请先删除旧隧道: cloudflared tunnel delete $TUNNEL_NAME" ;;
+            tunnel_config_done) echo "✓ Tunnel 配置已生成" ;;
+            dns_already) echo "⚠️  DNS 已存在" ;;
+            dns_done) echo "✓ DNS 路由成功" ;;
+            dns_failed) echo "⚠️  DNS 路由失败" ;;
+            skip_access) echo "跳过 CF Access (--no-access)" ;;
+            cf_access_title) echo "===== Cloudflare Access =====" ;;
+            team_name_prompt) echo "▶ Zero Trust Team Name (如 myteam): " ;;
+            email_prompt) echo "▶ 允许的邮箱: " ;;
+            creating_app) echo "创建 Access Application..." ;;
+            app_created) echo "✓ Application 已创建" ;;
+            app_failed) echo "无法创建 Access Application" ;;
+            policy_created) echo "✓ Policy 已创建" ;;
+            jwt_enabled) echo "✓ Origin JWT 验证已启用" ;;
+            verifying) echo "===== 部署验证 =====" ;;
+            openclaw_check) echo "OpenClaw 监听..." ;;
+            tunnel_check) echo "Tunnel 进程..." ;;
+            tunnel_healthy) echo "✓ Tunnel 已连通" ;;
+            tunnel_not_healthy) echo "⚠️  Tunnel 进程在但尚未连通" ;;
+            tunnel_not_found) echo "⚠️  未检测到 Tunnel 进程" ;;
+            domain_check) echo "域名可达性..." ;;
+            deploy_ok) echo "✅ 部署验证通过" ;;
+            deploy_partial) echo "⚠️  部分检查未通过" ;;
+            uninstall_title) echo "===== 卸载 =====" ;;
+            confirm_uninstall) echo "确认卸载? (y/n): " ;;
+            uninstall_oc) echo "卸载 OpenClaw CLI? (y/n): " ;;
+            uninstall_tunnel) echo "删除 Cloudflare Tunnel? (y/n): " ;;
+            uninstall_dns) echo "删除 CF DNS 记录? (y/n): " ;;
+            tunnel_delete_failed) echo "⚠️  隧道删除失败，保留 ~/.cloudflared" ;;
+            no_domain_skip) echo "⚠️  未指定域名，跳过 DNS 删除" ;;
+            uninstall_done) echo "✅ 卸载完成" ;;
+            deploy_success) echo "✅ 部署成功！" ;;
+            unknown_arg) echo "未知参数: $1" ;;
+            *) echo "$key" ;;
+        esac
     fi
 }
-_quiet_end() {
-    if [ "$_quiet_save" = "x" ]; then
-        set -x
-        _quiet_save=""
-    fi
-}
+
 
 # ========== OS 检测 ==========
 
@@ -623,7 +758,9 @@ loglevel: info
 EOF
     success "✓ Tunnel 配置已生成"
     info "配置 DNS 路由..."
-    cloudflared tunnel route dns "$TUNNEL_NAME" "$DOMAIN" 2>&1 | grep -qi "already" && warn "⚠️  DNS 已存在" || success "✓ DNS 路由成功"
+    local dns_out
+    dns_out=$(cloudflared tunnel route dns "$TUNNEL_NAME" "$DOMAIN" 2>&1) || { warn "⚠️  DNS 路由失败: $dns_out"; return 0; }
+    echo "$dns_out" | grep -qi "already" && warn "⚠️  DNS 已存在" || success "✓ DNS 路由成功"
 }
 
 configure_cf_access() {
@@ -636,33 +773,38 @@ configure_cf_access() {
     local api="https://api.cloudflare.com/client/v4"
 
     # 屏蔽 set -x 防止 Token 进日志
-    _quiet
+    (_safe;
     info "创建 Access Application..."
     local resp=$(curl -s -X POST "$api/accounts/$CF_ACCOUNT_ID/access/apps" \
         -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
         -d '{"name":"OpenClaw","domain":"'"$DOMAIN"'","type":"self_hosted","session_duration":"24h","auto_redirect_to_identity":false}' \
         2>> "$LOG_FILE")
-    _quiet_end
+    )
 
     local app_id=$(json_field "$resp" '.result.id')
     local app_aud=$(json_field "$resp" '.result.aud')
     if [ -z "$app_id" ] || [ "$app_id" = "null" ]; then
-        _quiet
+        (_safe;
         local existing=$(curl -s "$api/accounts/$CF_ACCOUNT_ID/access/apps" \
             -H "Authorization: Bearer $CF_API_TOKEN" 2>> "$LOG_FILE")
-        _quiet_end
-        app_id=$(json_field "$existing" '.result[0].id')
-        app_aud=$(json_field "$existing" '.result[0].aud')
+        )
+        if command -v jq &>/dev/null; then
+            app_id=$(echo "$existing" | jq -r '.result[] | select(.domain=="'"$DOMAIN"'") | .id' 2>/dev/null)
+            app_aud=$(echo "$existing" | jq -r '.result[] | select(.domain=="'"$DOMAIN"'") | .aud' 2>/dev/null)
+        else
+            app_id=$(echo "$existing" | sed -n '/"domain":"'"$DOMAIN"'"/{n;s/.*"id":"\([^"]*\)".*//p;}' | head -1)
+            app_aud=$(echo "$existing" | sed -n '/"domain":"'"$DOMAIN"'"/{n;s/.*"aud":"\([^"]*\)".*//p;}' | head -1)
+        fi
     fi
     [ -z "$app_id" ] || [ "$app_id" = "null" ] && error "无法创建 Access Application"
     success "✓ Application: $app_id (AUD: $app_aud)"
 
-    _quiet
+    (_safe;
     curl -s -X POST "$api/accounts/$CF_ACCOUNT_ID/access/apps/$app_id/policies" \
         -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
         -d '{"name":"Whitelist","decision":"allow","include":[{"email":{"email":"'"$ACCESS_EMAIL"'"}}]}' \
         >> "$LOG_FILE" 2>&1
-    _quiet_end
+    )
     success "✓ Policy 已创建"
 
     cat > "$CF_CONFIG_DIR/config.yml" <<EOF
@@ -700,11 +842,17 @@ verify_deployment() {
     fi
     info "Tunnel 进程..."
     if pgrep -f "cloudflared.*tunnel" &>/dev/null; then
-        success "✓ 运行中"
+        success "✓ 进程运行中"
+        # 检查隧道是否真正连通
+        if cloudflared tunnel info "$TUNNEL_NAME" 2>/dev/null | grep -qi "HEALTHY\|active\|connected"; then
+            success "✓ Tunnel 已连通"
+        else
+            warn "⚠️  Tunnel 进程在但尚未连通（可能需要更多时间握手）"
+        fi
     else
         sleep 15
         if pgrep -f "cloudflared.*tunnel" &>/dev/null; then
-            success "✓ 已启动"
+            success "✓ Tunnel 已启动"
         else
             warn "⚠️  未检测到 Tunnel 进程"
             ok=false
@@ -743,8 +891,13 @@ uninstall() {
     read -p "删除 Cloudflare Tunnel? (y/n): " -n 1 -r; echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         local tid=$(cloudflared tunnel list 2>/dev/null | grep "$TUNNEL_NAME" | awk '{print $1}')
-        [ -n "$tid" ] && cloudflared tunnel delete "$tid" 2>/dev/null || true
-        rm -rf "$HOME/.cloudflared"
+        if [ -n "$tid" ]; then
+            if cloudflared tunnel delete "$tid" 2>/dev/null; then
+                rm -rf "$HOME/.cloudflared"
+            else
+                warn "⚠️  隧道删除失败，保留 ~/.cloudflared"
+            fi
+        fi
     fi
     if [ -n "$DOMAIN" ]; then
         read -p "删除 CF DNS 记录? (y/n): " -n 1 -r; echo
@@ -773,6 +926,7 @@ ClawHole v$SCRIPT_VERSION — OpenClaw 私有部署
   --cf-team-name <name>     Zero Trust Team Name
   --access-email <email>    Access 白名单邮箱
   --uninstall               卸载
+  --lang <zh|en>            语言 (默认自动检测)
   --debug                   调试模式 (set -x)
   --help                    帮助
 
@@ -814,13 +968,14 @@ main() {
             --cf-team-name) CF_TEAM_NAME="$2"; shift 2 ;;
             --access-email) ACCESS_EMAIL="$2"; shift 2 ;;
             --uninstall) UNINSTALL=true; shift ;;
+            --lang) LANG_CODE="$2"; shift 2 ;;
             --help) show_help ;;
             --debug) DEBUG=1; shift ;;
             *) error "未知参数: $1" ;;
         esac
     done
 
-    # --debug: 启用 set -x（但在 CF API 调用时会被 _quiet 屏蔽）
+    # --debug: 启用 set -x（CF API 调用在 subshell 里 _safe 屏蔽）
     [ "${DEBUG:-0}" = "1" ] && set -x
 
     detect_os
