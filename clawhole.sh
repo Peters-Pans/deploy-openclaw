@@ -41,6 +41,7 @@ readonly NC='\033[0m'
 OC_CONFIG_DIR=""
 CF_CONFIG_DIR=""
 LOG_FILE=""
+TUNNEL_ID=""   # Fix #3: 全局初始化，避免 configure_cf_access 引用空变量
 
 # ============================================================
 # 日志
@@ -113,7 +114,7 @@ port_in_use() {
 }
 
 # ============================================================
-# JSON 字段提取（jq 优先，回退到 sed）
+# JSON 字段提取（jq 优先，回退到 python3，最后才用 sed）
 # 用法: json_field <json_string> <jq_filter>
 # 例:   json_field "$resp" '.result.id'
 # ============================================================
@@ -121,8 +122,25 @@ json_field() {
     local json="$1" field="$2"
     if command -v jq &>/dev/null; then
         echo "$json" | jq -r "$field" 2>/dev/null
+    elif command -v python3 &>/dev/null; then
+        # python3 回退：支持简单的嵌套路径，如 .result.id
+        local py_keys
+        py_keys=$(echo "$field" | sed 's/^\.//' | sed "s/\./']['/g")
+        echo "$json" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    keys = '${py_keys}'.split(\"']['\")
+    for k in keys:
+        d = d[k]
+    print(d if d is not None else '')
+except Exception:
+    print('')
+" 2>/dev/null
     else
-        # 仅支持简单顶层字符串字段，如 .result.id → 提取 "id"
+        # Fix #6: sed 回退仅作最后手段，并注释说明其局限性
+        # 警告：此方式依赖 JSON 字段顺序，CF API 响应字段顺序无保证，
+        # 建议安装 jq：sudo apt-get install jq / brew install jq
         local key
         key=$(echo "$field" | sed 's/.*\.\([^.]*\)$/\1/')
         echo "$json" | sed -n "s/.*\"${key}\":\"\([^\"]*\)\".*/\1/p" | head -1
@@ -140,17 +158,18 @@ oc_set_token() {
         return 0
     fi
     # 若 openclaw 不支持 --stdin，回退到临时文件（权限 600）
-    # 注意：此时 Token 仍不会出现在命令行参数中
     local tmpf
     tmpf=$(mktemp) || error "无法创建临时文件"
-    # trap 保证任何退出路径都清理临时文件
     trap 'rm -f "$tmpf"' RETURN
     chmod 600 "$tmpf"
     printf '%s' "$token" > "$tmpf"
-    # 通过文件重定向传入；若也不支持，最后才用命令行参数
-    openclaw config set gateway.auth.token --file "$tmpf" >> "$LOG_FILE" 2>&1 || \
-    openclaw config set gateway.auth.token "$(cat "$tmpf")" >> "$LOG_FILE" 2>&1 || \
-        error "无法写入 OpenClaw Token，请检查 openclaw 版本"
+    if openclaw config set gateway.auth.token --file "$tmpf" >> "$LOG_FILE" 2>&1; then
+        return 0
+    fi
+    # Fix #7: 移除"把 Token 展开到命令行参数"的危险回退，直接报错
+    # 原代码此处会执行 openclaw config set gateway.auth.token "$(cat $tmpf)"
+    # 导致 Token 出现在 ps aux 进程参数列表中
+    error "无法安全写入 OpenClaw Token（--stdin 和 --file 均不支持），请升级 openclaw 版本"
 }
 
 oc_config_set() {
@@ -226,6 +245,19 @@ check_system_compat() {
 # ============================================================
 # 依赖安装
 # ============================================================
+
+# Fix #1: 提取架构映射为独立函数，供多处复用，避免 uname -m 原始值直接拼 URL
+_map_arch() {
+    local raw
+    raw=$(uname -m)
+    case "$raw" in
+        x86_64|amd64)  echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        armv7l)        echo "arm"   ;;
+        *) error "不支持的 CPU 架构: $raw" ;;
+    esac
+}
+
 install_cloudflared() {
     if command -v cloudflared &>/dev/null; then
         local ver
@@ -249,21 +281,16 @@ $(lsb_release -cs 2>/dev/null || echo focal) main" \
             sudo apt-get install -y cloudflared >> "$LOG_FILE" 2>&1
             ;;
         rhel|fedora)
+            # Fix #1: RHEL/Fedora 同样需要将 uname -m (x86_64) 映射为包名中的 amd64
             local arch
-            arch=$(uname -m)
+            arch=$(_map_arch)
             local rpm_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}.rpm"
             sudo rpm -i "$rpm_url" >> "$LOG_FILE" 2>&1 \
                 || sudo yum install -y "$rpm_url" >> "$LOG_FILE" 2>&1
             ;;
         *)
             local arch
-            arch=$(uname -m)
-            case "$arch" in
-                x86_64|amd64)   arch="amd64" ;;
-                aarch64|arm64)  arch="arm64" ;;
-                armv7l)         arch="arm"   ;;
-                *) error "不支持的 CPU 架构: $arch" ;;
-            esac
+            arch=$(_map_arch)
             sudo curl -fsSL \
                 "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}" \
                 -o /usr/local/bin/cloudflared
@@ -316,7 +343,7 @@ install_openclaw() {
         local ver
         ver=$(openclaw --version 2>/dev/null | head -n1)
         info "已安装 OpenClaw $ver"
-        read -p "更新到最新版? (y/n): " -n 1 -r; echo
+        read -rp "更新到最新版? (y/n): " -n 1; echo
         [[ ! $REPLY =~ ^[Yy]$ ]] && return 0
     fi
     local npm_root
@@ -340,6 +367,11 @@ check_dependencies() {
         command -v brew &>/dev/null || error "需要 Homebrew: https://brew.sh"
         success "✓ Homebrew"
     fi
+    # 提示安装 jq（json_field 的 sed 回退不可靠）
+    if ! command -v jq &>/dev/null; then
+        warn "⚠️  未检测到 jq，建议安装以确保 Cloudflare API 解析可靠"
+        warn "    macOS: brew install jq  |  Ubuntu/Debian: sudo apt-get install jq"
+    fi
     install_nodejs
     install_cloudflared
     success "依赖检查完成"
@@ -352,10 +384,33 @@ find_openclaw_bin() {
     command -v openclaw 2>/dev/null || echo "/usr/local/bin/openclaw"
 }
 
+# Fix #2: macOS 13 (Ventura)+ 废弃了 launchctl load/unload，改用 bootstrap/bootout
+# 检测 macOS 主版本号，据此选择正确的 launchctl 命令
+_launchctl_load() {
+    local plist="$1"
+    local macos_major
+    macos_major=$(sw_vers -productVersion 2>/dev/null | cut -d. -f1)
+    if [ "${macos_major:-0}" -ge 13 ]; then
+        launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null || true
+    else
+        launchctl load "$plist" 2>/dev/null || true
+    fi
+}
+
+_launchctl_unload() {
+    local plist="$1"
+    local macos_major
+    macos_major=$(sw_vers -productVersion 2>/dev/null | cut -d. -f1)
+    if [ "${macos_major:-0}" -ge 13 ]; then
+        launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null || true
+    else
+        launchctl unload "$plist" 2>/dev/null || true
+    fi
+}
+
 _install_launchd() {
     local oc_bin="$1"
     local cf_bin
-    # 动态获取路径，兼容 Intel (/usr/local/bin) 和 Apple Silicon (/opt/homebrew/bin)
     cf_bin=$(command -v cloudflared 2>/dev/null || echo "/opt/homebrew/bin/cloudflared")
     local dir="$HOME/Library/LaunchAgents"
     mkdir -p "$dir"
@@ -417,16 +472,16 @@ EOF
 </dict></plist>
 EOF
 
-    launchctl unload "$dir/ai.openclaw.gateway.plist"          2>/dev/null || true
-    launchctl load   "$dir/ai.openclaw.gateway.plist"
-    launchctl unload "$dir/com.cloudflare.cloudflared.plist"   2>/dev/null || true
-    launchctl load   "$dir/com.cloudflare.cloudflared.plist"
+    _launchctl_unload "$dir/ai.openclaw.gateway.plist"
+    _launchctl_load   "$dir/ai.openclaw.gateway.plist"
+    _launchctl_unload "$dir/com.cloudflare.cloudflared.plist"
+    _launchctl_load   "$dir/com.cloudflare.cloudflared.plist"
 }
 
 _uninstall_launchd() {
     local dir="$HOME/Library/LaunchAgents"
-    launchctl unload "$dir/ai.openclaw.gateway.plist"         2>/dev/null || true
-    launchctl unload "$dir/com.cloudflare.cloudflared.plist"  2>/dev/null || true
+    _launchctl_unload "$dir/ai.openclaw.gateway.plist"
+    _launchctl_unload "$dir/com.cloudflare.cloudflared.plist"
     rm -f "$dir/ai.openclaw.gateway.plist"
     rm -f "$dir/com.cloudflare.cloudflared.plist"
 }
@@ -508,8 +563,10 @@ service_uninstall() {
 service_start() {
     case "$OS_FAMILY" in
         macos)
-            launchctl start ai.openclaw.gateway         2>/dev/null || true
-            launchctl start com.cloudflare.cloudflared  2>/dev/null || true
+            # Fix #2: 同样使用封装函数，兼容 macOS 13+
+            local dir="$HOME/Library/LaunchAgents"
+            _launchctl_load "$dir/ai.openclaw.gateway.plist"
+            _launchctl_load "$dir/com.cloudflare.cloudflared.plist"
             ;;
         *)
             sudo systemctl start openclaw-gateway   2>/dev/null || true
@@ -521,10 +578,9 @@ service_start() {
 service_stop() {
     case "$OS_FAMILY" in
         macos)
-            launchctl stop   ai.openclaw.gateway         2>/dev/null || true
-            launchctl stop   com.cloudflare.cloudflared  2>/dev/null || true
-            launchctl unload "$HOME/Library/LaunchAgents/ai.openclaw.gateway.plist"        2>/dev/null || true
-            launchctl unload "$HOME/Library/LaunchAgents/com.cloudflare.cloudflared.plist" 2>/dev/null || true
+            local dir="$HOME/Library/LaunchAgents"
+            _launchctl_unload "$dir/ai.openclaw.gateway.plist"
+            _launchctl_unload "$dir/com.cloudflare.cloudflared.plist"
             ;;
         *)
             sudo systemctl stop    openclaw-gateway   2>/dev/null || true
@@ -539,12 +595,10 @@ service_stop() {
 # DNS 备份 / 设置 / 恢复
 # ============================================================
 
-# 获取 macOS 活跃网卡的 networksetup 服务名
 _macos_active_iface_name() {
     local default_dev
     default_dev=$(route get default 2>/dev/null | awk '/interface:/{print $2}')
     [ -z "$default_dev" ] && return 1
-    # 从 networksetup -listnetworkserviceorder 找到对应服务名
     networksetup -listnetworkserviceorder 2>/dev/null \
         | grep -B1 "Device: ${default_dev})" \
         | head -1 \
@@ -569,13 +623,28 @@ dns_backup() {
             info "DNS 已备份 (接口: $iface)"
             ;;
         *)
-            if [ -f /etc/resolv.conf ]; then
+            # Fix #4: 检测 systemd-resolved，避免直接覆写符号链接破坏 resolved
+            if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+                # 通过 resolvectl 备份，不动 /etc/resolv.conf
+                local iface
+                iface=$(ip route 2>/dev/null | awk '/default/{print $5; exit}')
+                {
+                    echo "resolved"
+                    echo "$iface"
+                    resolvectl dns "$iface" 2>/dev/null || true
+                } > "$backup_file"
+                chmod 600 "$backup_file"
+                info "DNS 已备份 (resolvectl, 接口: $iface)"
+            elif [ -f /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ]; then
+                # 仅在 resolv.conf 是真实文件（非符号链接）时才备份并直接修改
                 {
                     echo "linux"
                     cat /etc/resolv.conf
                 } > "$backup_file"
                 chmod 600 "$backup_file"
                 info "DNS 已备份 (/etc/resolv.conf)"
+            else
+                warn "⚠️  /etc/resolv.conf 是符号链接且 systemd-resolved 未运行，跳过 DNS 备份"
             fi
             ;;
     esac
@@ -595,7 +664,9 @@ dns_set() {
                 || warn "⚠️  DNS 设置失败"
             ;;
         *)
-            if command -v resolvectl &>/dev/null; then
+            # Fix #4: 优先用 resolvectl（兼容 systemd-resolved），
+            # 仅当 resolv.conf 确实是普通文件时才直接写入
+            if command -v resolvectl &>/dev/null && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
                 local iface
                 iface=$(ip route 2>/dev/null | awk '/default/{print $5; exit}')
                 if [ -n "$iface" ]; then
@@ -605,7 +676,7 @@ dns_set() {
                 else
                     warn "⚠️  无法检测默认网卡，跳过 DNS 设置"
                 fi
-            else
+            elif [ -f /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ]; then
                 sudo tee /etc/resolv.conf > /dev/null <<'EOF'
 nameserver 1.1.1.1
 nameserver 1.0.0.1
@@ -613,6 +684,8 @@ options edns0
 EOF
                 success "✓ DNS 已设置 (/etc/resolv.conf)"
                 warn "⚠️  注意: NetworkManager 可能在下次连接时覆盖此配置"
+            else
+                warn "⚠️  /etc/resolv.conf 是符号链接，跳过 DNS 直写（由 systemd-resolved 管理）"
             fi
             ;;
     esac
@@ -633,7 +706,6 @@ dns_restore() {
                 rm -f "$backup_file"
                 return 0
             fi
-            # 第 3 行起是原 DNS 服务器列表
             local dns_servers
             dns_servers=$(sed -n '3,$p' "$backup_file" | tr '\n' ' ' | sed 's/ $//')
             if [ -z "$dns_servers" ] || echo "$dns_servers" | grep -qi "empty\|There aren't"; then
@@ -645,10 +717,29 @@ dns_restore() {
                     && success "✓ DNS 已恢复 → $dns_servers (接口: $iface)"
             fi
             ;;
+        resolved)
+            # Fix #4: systemd-resolved 备份的恢复路径
+            local iface
+            iface=$(sed -n '2p' "$backup_file")
+            local orig_dns
+            orig_dns=$(sed -n '3,$p' "$backup_file" | tr '\n' ' ' | xargs)
+            if [ -n "$iface" ] && [ -n "$orig_dns" ]; then
+                # shellcheck disable=SC2086
+                sudo resolvectl dns "$iface" $orig_dns 2>/dev/null \
+                    && success "✓ DNS 已恢复 (resolvectl, 接口: $iface → $orig_dns)" \
+                    || warn "⚠️  resolvectl 恢复失败，请手动检查 DNS 配置"
+            else
+                warn "⚠️  DNS 备份数据不完整，跳过恢复"
+            fi
+            ;;
         linux)
-            # 重建 resolv.conf（跳过第一行 "linux" 标记）
-            sudo tee /etc/resolv.conf > /dev/null < <(sed -n '2,$p' "$backup_file")
-            success "✓ DNS 已恢复 (/etc/resolv.conf)"
+            # 确认目标是真实文件才写入
+            if [ ! -L /etc/resolv.conf ]; then
+                sudo tee /etc/resolv.conf > /dev/null < <(sed -n '2,$p' "$backup_file")
+                success "✓ DNS 已恢复 (/etc/resolv.conf)"
+            else
+                warn "⚠️  /etc/resolv.conf 当前是符号链接，跳过恢复（可能已由系统接管）"
+            fi
             ;;
         *)
             warn "⚠️  未知 DNS 备份格式，跳过恢复"
@@ -777,7 +868,6 @@ configure_tunnel() {
     if cloudflared tunnel list 2>/dev/null | grep -qw "$TUNNEL_NAME"; then
         tunnel_id=$(cloudflared tunnel list 2>/dev/null | awk -v name="$TUNNEL_NAME" '$0 ~ name {print $1; exit}')
         warn "⚠️  检测到同名隧道，复用: $tunnel_id"
-        # 凭据文件必须存在，否则隧道无法启动
         if [ ! -f "$CF_CONFIG_DIR/${tunnel_id}.json" ]; then
             error "凭据文件 $CF_CONFIG_DIR/${tunnel_id}.json 不存在。
   请先手动删除旧隧道: cloudflared tunnel delete $TUNNEL_NAME
@@ -792,7 +882,7 @@ configure_tunnel() {
         success "✓ 隧道创建成功: $tunnel_id"
     fi
 
-    # 写入 TUNNEL_ID 供后续函数使用
+    # Fix #3: 赋值到全局变量（已在顶部初始化）
     TUNNEL_ID="$tunnel_id"
 
     # 生成 config.yml
@@ -818,7 +908,7 @@ loglevel: info
 EOF
     success "✓ Tunnel 配置已生成 ($CF_CONFIG_DIR/config.yml)"
 
-    # 配置 DNS 路由，明确区分成功/失败/已存在
+    # 配置 DNS 路由
     info "配置 DNS 路由 ($DOMAIN → 隧道)..."
     local dns_out dns_exit=0
     dns_out=$(cloudflared tunnel route dns "$TUNNEL_NAME" "$DOMAIN" 2>&1) || dns_exit=$?
@@ -843,6 +933,9 @@ configure_cf_access() {
         return 0
     fi
 
+    # Fix #3: 确保 TUNNEL_ID 已由 configure_tunnel 赋值
+    [ -z "$TUNNEL_ID" ] && error "TUNNEL_ID 未设置，请确保 configure_tunnel 在此之前已成功执行"
+
     echo -e "${GREEN}===== Cloudflare Access (Zero Trust) =====${NC}"
 
     # 收集必要参数
@@ -859,7 +952,6 @@ configure_cf_access() {
     info "创建 Access Application..."
     local resp app_id app_aud
 
-    # _sensitive_begin/end 在父 shell 中临时关闭 set -x，防止 Token 进日志
     _sensitive_begin
     resp=$(curl -sf -X POST "$api/accounts/$CF_ACCOUNT_ID/access/apps" \
         -H "Authorization: Bearer $CF_API_TOKEN" \
@@ -872,7 +964,6 @@ configure_cf_access() {
     app_id=$(json_field "$resp" '.result.id')
     app_aud=$(json_field "$resp" '.result.aud')
 
-    # 若创建失败（可能已存在），则按 domain 查找已有 Application
     if [ -z "$app_id" ] || [ "$app_id" = "null" ]; then
         warn "创建失败或已存在，尝试查找已有 Application..."
         local existing_resp
@@ -886,8 +977,34 @@ configure_cf_access() {
         if command -v jq &>/dev/null; then
             app_id=$(echo "$existing_resp"  | jq -r ".result[] | select(.domain==\"$DOMAIN\") | .id"  2>/dev/null | head -1)
             app_aud=$(echo "$existing_resp" | jq -r ".result[] | select(.domain==\"$DOMAIN\") | .aud" 2>/dev/null | head -1)
+        elif command -v python3 &>/dev/null; then
+            # python3 回退，可靠解析不依赖字段顺序
+            app_id=$(echo "$existing_resp" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    for app in data.get('result', []):
+        if app.get('domain') == '$DOMAIN':
+            print(app.get('id', ''))
+            break
+except Exception:
+    pass
+" 2>/dev/null)
+            app_aud=$(echo "$existing_resp" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    for app in data.get('result', []):
+        if app.get('domain') == '$DOMAIN':
+            print(app.get('aud', ''))
+            break
+except Exception:
+    pass
+" 2>/dev/null)
         else
-            # sed fallback：在 JSON 里找到 domain 匹配的对象，取其 id 和 aud
+            # Fix #6: sed 回退有字段顺序依赖风险，输出明确警告
+            warn "⚠️  未安装 jq 或 python3，使用 sed 解析 CF API 响应（可能不稳定）"
+            warn "    强烈建议安装 jq: sudo apt-get install jq / brew install jq"
             app_id=$(echo "$existing_resp"  | sed -n "s/.*\"domain\":\"$DOMAIN\".*\"id\":\"\([^\"]*\)\".*/\1/p" | head -1)
             app_aud=$(echo "$existing_resp" | sed -n "s/.*\"domain\":\"$DOMAIN\".*\"aud\":\"\([^\"]*\)\".*/\1/p" | head -1)
         fi
@@ -963,7 +1080,6 @@ verify_deployment() {
 
     if pgrep -f "cloudflared.*tunnel" &>/dev/null; then
         success "✓ cloudflared 进程运行中"
-        # 检查隧道是否真正建连（而非仅进程存在）
         if cloudflared tunnel info "$TUNNEL_NAME" 2>/dev/null \
                 | grep -qiE "HEALTHY|active connection|ACTIVE"; then
             success "✓ Tunnel 已连通"
@@ -1001,22 +1117,18 @@ uninstall() {
     read -rp "确认卸载所有组件? (y/n): " -n 1; echo
     [[ ! $REPLY =~ ^[Yy]$ ]] && exit 0
 
-    # 停止并移除服务
     openclaw gateway stop 2>/dev/null || true
     service_stop
     service_uninstall
 
-    # 清理 OpenClaw 配置
     openclaw config unset gateway.port       2>/dev/null || true
     openclaw config unset gateway.bind       2>/dev/null || true
     openclaw config unset gateway.auth.mode  2>/dev/null || true
     openclaw config unset gateway.auth.token 2>/dev/null || true
     rm -f "$OC_CONFIG_DIR/.auth_token"
 
-    # 恢复 DNS
     dns_restore
 
-    # 可选：卸载 OpenClaw CLI
     read -rp "卸载 OpenClaw CLI? (y/n): " -n 1; echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         local npm_root
@@ -1029,7 +1141,6 @@ uninstall() {
         success "✓ OpenClaw CLI 已卸载"
     fi
 
-    # 可选：删除 Cloudflare Tunnel（必须在删除 ~/.cloudflared 之前）
     read -rp "删除 Cloudflare Tunnel '$TUNNEL_NAME'? (y/n): " -n 1; echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         local tid
@@ -1047,7 +1158,6 @@ uninstall() {
         fi
     fi
 
-    # 可选：删除 Cloudflare DNS 记录
     if [ -n "${DOMAIN:-}" ]; then
         read -rp "删除 Cloudflare DNS 记录 ($DOMAIN)? (y/n): " -n 1; echo
         if [[ $REPLY =~ ^[Yy]$ ]]; then
@@ -1123,7 +1233,6 @@ EOF
 # 主流程
 # ============================================================
 main() {
-    # 解析参数
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --domain)        DOMAIN="$2";        shift 2 ;;
@@ -1140,13 +1249,10 @@ main() {
         esac
     done
 
-    # debug 模式在路径初始化前开启（敏感命令由 _sensitive_begin/end 屏蔽）
     [ "${DEBUG:-0}" = "1" ] && set -x
 
-    # OS 检测（卸载流程也需要）
     detect_os
 
-    # 初始化路径（必须在任何 log/info 调用之前完成）
     OC_CONFIG_DIR="$HOME/.openclaw"
     CF_CONFIG_DIR="$HOME/.cloudflared"
     LOG_FILE="$OC_CONFIG_DIR/deploy-${TIMESTAMP}.log"
@@ -1154,10 +1260,8 @@ main() {
     touch "$LOG_FILE"
     chmod 600 "$LOG_FILE"
 
-    # 卸载流程
     [ "${UNINSTALL:-false}" = "true" ] && uninstall
 
-    # 部署流程
     banner
     check_dependencies
     get_user_config
@@ -1184,14 +1288,12 @@ main() {
 # 入口
 # ============================================================
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    # Bash 版本检查（需要 3.2+ 支持 read -ra）
     if [ "${BASH_VERSINFO[0]}" -lt 3 ] || \
        { [ "${BASH_VERSINFO[0]}" -eq 3 ] && [ "${BASH_VERSINFO[1]}" -lt 2 ]; }; then
         echo "错误: 需要 Bash 3.2 或更高版本（当前: $BASH_VERSION）"
         exit 1
     fi
 
-    # root 警告（Linux）
     if [[ $EUID -eq 0 ]] && [[ "$(uname)" != "Darwin" ]]; then
         echo -e "${YELLOW}⚠️  不建议以 root 身份运行，脚本会在需要时自动使用 sudo${NC}"
         read -rp "仍要继续? (y/n): " -n 1; echo
