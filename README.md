@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Platform: macOS](https://img.shields.io/badge/Platform-macOS-999999.svg)](https://www.apple.com/macos/)
-[![Privacy: Enhanced](https://img.shields.io/badge/Privacy-Enhanced-green.svg)](https://github.com/Peters-Pans/deploy-openclaw.sh)
+[![Privacy: Enhanced](https://img.shields.io/badge/Privacy-Enhanced-green.svg)](https://github.com/Peters-Pans/deploy-openclaw)
 
 > 🦞 一键部署 OpenClaw + Cloudflare Tunnel，适配中国大陆动态 IPv4 环境  
 > **无需公网 IP | 无需端口转发 | 无需备案 | 真实 IP 完全隐藏**
@@ -83,3 +83,29 @@
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Peters-Pans/deploy-openclaw/main/deploy-openclaw.sh | bash
+```
+
+### 方式二：手动下载
+
+```bash
+git clone https://github.com/Peters-Pans/deploy-openclaw.git
+cd deploy-openclaw
+chmod +x deploy-openclaw.sh
+./deploy-openclaw.sh
+```
+
+---
+
+## 🔧 配置说明
+
+部署脚本通过 `openclaw config set` 写入以下配置项（写入 `~/.openclaw/openclaw.json`）：
+
+| 配置项 | 值 | 说明 |
+|--------|-----|------|
+| `gateway.port` | 用户指定 (默认 10371) | Gateway 监听端口 |
+| `gateway.bind` | `loopback` | 仅监听 127.0.0.1，不暴露公网 |
+| `gateway.mode` | `local` | 本地运行模式 |
+| `gateway.auth.mode` | `token` | Token 认证 |
+| `gateway.auth.token` | 自动生成 64 位 hex | 访问令牌 |
+
+> ⚠️ v2.2 修正：配置文件为 `openclaw.json`（非 `config.json`），通过 `openclaw config set` 写入确保 schema 合规。
