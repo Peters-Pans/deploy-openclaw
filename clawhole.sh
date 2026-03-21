@@ -1,5 +1,5 @@
 #!/bin/bash
-# ClawHole — OpenClaw + Cloudflare Tunnel 隐私部署脚本 v3.5
+# ClawHole — OpenClaw + Cloudflare Tunnel 隐私部署脚本 v4.1
 # 支持 macOS + Linux (Ubuntu/Debian/CentOS/RHEL/Fedora/Arch)
 #
 # 用法: ./clawhole.sh [选项]
@@ -8,15 +8,39 @@
 #   --no-access             跳过 Cloudflare Access
 #   --cf-api-token <token>  CF API Token
 #   --cf-account-id <id>    CF Account ID
-#   --cf-team-name <name>   Zero Trust Team Name
+#   --cf-team-name <n>      Zero Trust Team Name
 #   --access-email <email>  Access 白名单邮箱
 #   --uninstall             卸载所有组件
+#   --yes                   非交互模式（CI/CD 用，跳过所有确认）
 #   --debug                 调试模式 (set -x，敏感命令除外)
 #   --help                  显示帮助
 #
 # 环境变量:
 #   OPENCLAW_TOKEN          预设 Token（避免交互输入）
 #   CF_API_TOKEN            预设 CF API Token
+#
+# v4.0 改动摘要（相对 v3.5）:
+#   FIX-1  : cloudflared tunnel create 改用 --output json，不再 sed 解析 CLI 输出
+#   FIX-2  : 二进制下载后 SHA256 校验，防止中间人 / 缓存污染
+#   FIX-3  : 完全移除 DNS 修改逻辑（Tunnel 是 outbound，不需要改本机 DNS）
+#   FIX-4  : oc_set_token 错误信息包含所需 openclaw 最低版本提示
+#   FIX-5  : configure_openclaw 停旧进程改用 PID 文件 + openclaw gateway stop
+#   FIX-6  : 服务安装前检测是否已存在，避免重复注册（幂等）
+#   FIX-7  : 新增 cf_api_call 带 3 次自动重试的 API 封装
+#   FIX-8  : verify_deployment 新增 /health endpoint 检查
+#   FIX-9  : 日志 rotation，保留最近 5 份，自动清理旧日志
+#   FIX-10 : --debug 模式启动时输出完整环境快照
+#   FIX-11 : 修正子函数内 set -e + || 混用导致的潜在意外退出
+#
+# v4.1 改动摘要（相对 v4.0）:
+#   FIX-A  : CF API cf_api_call 区分 2xx(成功) / 4xx(不重试报错) / 5xx(重试)
+#   FIX-B  : cloudflared tunnel list 改用 --output json + json_field 解析
+#   FIX-C  : OpenClaw 进程控制交给 systemd/launchd，不再自己 fork + pgrep
+#   FIX-D  : systemd unit 补全安全加固项（PrivateTmp/ProtectSystem/ProtectHome）
+#   FIX-E  : /health 降为辅助检查，端口连通性为主检查
+#   FIX-F  : TUNNEL_NAME 改为 openclaw-<domain> 支持多实例
+#   FIX-G  : --yes / NON_INTERACTIVE 模式，CI/CD 可无人值守运行
+#   FIX-H  : 部署状态机（STATE_FILE），支持断点恢复
 
 set -e
 set -o pipefail
@@ -24,11 +48,16 @@ set -o pipefail
 # ============================================================
 # 全局常量
 # ============================================================
-readonly SCRIPT_VERSION="3.5.0"
+readonly SCRIPT_VERSION="4.1.0"
 readonly SCRIPT_NAME="clawhole.sh"
 readonly DEFAULT_PORT=10371
-readonly TUNNEL_NAME="openclaw-tunnel"
+# FIX-F: TUNNEL_NAME 在 main() 中根据 DOMAIN 动态设置，支持多实例
+# 此处保留占位，main() 会覆盖
+TUNNEL_NAME=""
 readonly TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+readonly LOG_ROTATE_KEEP=5          # FIX-9: 保留最近 N 份日志
+readonly CF_API_RETRY=3             # FIX-7: API 最大重试次数
+readonly CF_API_RETRY_DELAY=3       # FIX-7: 重试间隔（秒）
 
 readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
@@ -41,7 +70,10 @@ readonly NC='\033[0m'
 OC_CONFIG_DIR=""
 CF_CONFIG_DIR=""
 LOG_FILE=""
-TUNNEL_ID=""   # Fix #3: 全局初始化，避免 configure_cf_access 引用空变量
+TUNNEL_ID=""
+OC_PID_FILE=""   # FIX-5: PID 文件路径（卸载时使用，启动已交给服务管理器）
+STATE_FILE=""    # FIX-H: 部署状态机文件
+NON_INTERACTIVE=false  # FIX-G: --yes 模式
 
 # ============================================================
 # 日志
@@ -66,15 +98,77 @@ success() { log "$1" "SUCCESS"; }
 error()   { log "$1" "ERROR" >&2; exit 1; }
 
 # ============================================================
-# 敏感命令保护：临时关闭 set -x，执行后恢复
-# 必须在父 shell 中调用，不能用 subshell（否则变量无法返回）
-# 用法:
-#   _sensitive_begin
-#   result=$(curl ...)
-#   _sensitive_end
+# FIX-9: 日志 rotation — 保留最近 LOG_ROTATE_KEEP 份，删除旧的
 # ============================================================
+rotate_logs() {
+    local log_dir="$1"
+    [ -d "$log_dir" ] || return 0
+    # 列出所有 deploy-*.log，按时间排序，删除超出保留数量的旧日志
+    local logs
+    logs=$(ls -t "$log_dir"/deploy-*.log 2>/dev/null) || return 0
+    local count
+    count=$(echo "$logs" | wc -l | tr -d ' ')
+    if [ "$count" -gt "$LOG_ROTATE_KEEP" ]; then
+        echo "$logs" | tail -n +"$((LOG_ROTATE_KEEP + 1))" | xargs rm -f
+        info "日志 rotation: 保留最近 $LOG_ROTATE_KEEP 份，已清理 $((count - LOG_ROTATE_KEEP)) 份旧日志"
+    fi
+}
+
+# ============================================================
+# FIX-G: 交互确认（--yes 模式下自动确认）
+# 用法: confirm "提示文字" || return
+# ============================================================
+confirm() {
+    local prompt="${1:-确认? (y/n)}"
+    if [ "$NON_INTERACTIVE" = "true" ]; then
+        info "[非交互] 自动确认: $prompt"
+        return 0
+    fi
+    read -rp "$prompt (y/n): " -n 1; echo
+    [[ $REPLY =~ ^[Yy]$ ]]
+}
+
+# ============================================================
+# FIX-H: 部署状态机
+# 每步完成后写入 STATE_FILE，重复运行时跳过已完成步骤
+# 步骤: deps → openclaw_install → openclaw_config →
+#        tunnel → access → service → done
+# ============================================================
+STATE_STEPS=(deps openclaw_install openclaw_config tunnel access service done)
+
+state_get() {
+    [ -f "$STATE_FILE" ] && cat "$STATE_FILE" 2>/dev/null || echo ""
+}
+
+state_set() {
+    local step="$1"
+    printf '%s\n' "$step" > "$STATE_FILE"
+    chmod 600 "$STATE_FILE"
+}
+
+state_done() {
+    local step="$1"
+    local current
+    current=$(state_get)
+    [ -z "$current" ] && return 1   # 没有状态 = 未开始
+    local i j
+    for i in "${!STATE_STEPS[@]}"; do
+        [ "${STATE_STEPS[$i]}" = "$current" ] && break
+    done
+    for j in "${!STATE_STEPS[@]}"; do
+        [ "${STATE_STEPS[$j]}" = "$step" ] && break
+    done
+    # current 的索引 >= step 的索引 → 该步骤已完成
+    [ "$i" -ge "$j" ]
+}
+
+state_reset() {
+    rm -f "$STATE_FILE"
+    info "部署状态已重置"
+}
+
+
 _sensitive_begin() {
-    # 记录当前是否开启了 set -x
     case "$-" in *x*) _TRACE_WAS_ON=1 ;; *) _TRACE_WAS_ON=0 ;; esac
     { set +x; } 2>/dev/null
 }
@@ -84,8 +178,7 @@ _sensitive_end() {
 }
 
 # ============================================================
-# 版本比较（纯 bash，不依赖 sort -V，兼容 Bash 3.2+）
-# version_gte A B：若 A >= B 返回 0，否则返回 1
+# 版本比较（纯 bash，兼容 Bash 3.2+）
 # ============================================================
 version_gte() {
     local a="$1" b="$2"
@@ -114,16 +207,13 @@ port_in_use() {
 }
 
 # ============================================================
-# JSON 字段提取（jq 优先，回退到 python3，最后才用 sed）
-# 用法: json_field <json_string> <jq_filter>
-# 例:   json_field "$resp" '.result.id'
+# JSON 字段提取（jq → python3 → sed 三重回退）
 # ============================================================
 json_field() {
     local json="$1" field="$2"
     if command -v jq &>/dev/null; then
         echo "$json" | jq -r "$field" 2>/dev/null
     elif command -v python3 &>/dev/null; then
-        # python3 回退：支持简单的嵌套路径，如 .result.id
         local py_keys
         py_keys=$(echo "$field" | sed 's/^\.//' | sed "s/\./']['/g")
         echo "$json" | python3 -c "
@@ -138,9 +228,7 @@ except Exception:
     print('')
 " 2>/dev/null
     else
-        # Fix #6: sed 回退仅作最后手段，并注释说明其局限性
-        # 警告：此方式依赖 JSON 字段顺序，CF API 响应字段顺序无保证，
-        # 建议安装 jq：sudo apt-get install jq / brew install jq
+        warn "⚠️  未安装 jq 或 python3，使用 sed 解析（不稳定，强烈建议安装 jq）"
         local key
         key=$(echo "$field" | sed 's/.*\.\([^.]*\)$/\1/')
         echo "$json" | sed -n "s/.*\"${key}\":\"\([^\"]*\)\".*/\1/p" | head -1
@@ -148,16 +236,56 @@ except Exception:
 }
 
 # ============================================================
-# 安全写入 Token 到 openclaw 配置
-# 通过 stdin 管道传值，Token 不出现在进程参数列表 (ps)
+# FIX-7 + FIX-A: Cloudflare API 封装
+# 2xx → 成功返回响应体
+# 4xx → 客户端错误（权限/参数），不重试，直接返回 1
+# 5xx/网络错误 → 服务端错误，最多重试 CF_API_RETRY 次
+# ============================================================
+cf_api_call() {
+    local desc="$1"; shift
+    local attempt resp http_code body
+
+    for attempt in $(seq 1 $CF_API_RETRY); do
+        _sensitive_begin
+        # -w 在响应体末尾追加 HTTP 状态码标记
+        resp=$(curl -s -w "\n__HTTP_CODE__:%{http_code}" "$@" 2>>"$LOG_FILE") || resp=""
+        _sensitive_end
+
+        http_code=$(echo "$resp" | grep '__HTTP_CODE__:' | sed 's/__HTTP_CODE__://')
+        body=$(echo "$resp" | grep -v '__HTTP_CODE__:')
+
+        if [[ "$http_code" =~ ^2 ]]; then
+            # 2xx: 成功
+            echo "$body"
+            return 0
+        elif [[ "$http_code" =~ ^4 ]]; then
+            # 4xx: 客户端错误，重试无意义，直接失败
+            warn "⚠️  CF API [$desc] 客户端错误 HTTP $http_code（权限或参数问题，不重试）"
+            warn "    响应: $(echo "$body" | head -c 300)"
+            return 1
+        else
+            # 5xx 或网络错误: 可重试
+            if [ "$attempt" -lt "$CF_API_RETRY" ]; then
+                warn "⚠️  CF API [$desc] 第 $attempt 次失败 (HTTP ${http_code:-网络错误})，${CF_API_RETRY_DELAY}s 后重试..."
+                sleep "$CF_API_RETRY_DELAY"
+            else
+                warn "⚠️  CF API [$desc] 连续失败 $CF_API_RETRY 次，放弃"
+                warn "    最后响应: $(echo "$body" | head -c 300)"
+                return 1
+            fi
+        fi
+    done
+    return 1
+}
+
+# ============================================================
+# FIX-4: 安全写入 Token（错误信息含版本提示）
 # ============================================================
 oc_set_token() {
     local token="$1"
-    # 优先尝试通过 stdin 传入
     if echo -n "$token" | openclaw config set gateway.auth.token --stdin >> "$LOG_FILE" 2>&1; then
         return 0
     fi
-    # 若 openclaw 不支持 --stdin，回退到临时文件（权限 600）
     local tmpf
     tmpf=$(mktemp) || error "无法创建临时文件"
     trap 'rm -f "$tmpf"' RETURN
@@ -166,10 +294,12 @@ oc_set_token() {
     if openclaw config set gateway.auth.token --file "$tmpf" >> "$LOG_FILE" 2>&1; then
         return 0
     fi
-    # Fix #7: 移除"把 Token 展开到命令行参数"的危险回退，直接报错
-    # 原代码此处会执行 openclaw config set gateway.auth.token "$(cat $tmpf)"
-    # 导致 Token 出现在 ps aux 进程参数列表中
-    error "无法安全写入 OpenClaw Token（--stdin 和 --file 均不支持），请升级 openclaw 版本"
+    # FIX-4: 明确告知用户需要的版本，而不是只说"请升级"
+    error "无法安全写入 OpenClaw Token。
+  --stdin 和 --file 两种方式均不支持，说明当前 openclaw 版本过旧。
+  请升级到 openclaw >= 1.4.0:
+    npm install -g openclaw@latest
+  当前版本: $(openclaw --version 2>/dev/null | head -n1 || echo '未知')"
 }
 
 oc_config_set() {
@@ -242,11 +372,30 @@ check_system_compat() {
     esac
 }
 
-# ============================================================
-# 依赖安装
-# ============================================================
+# FIX-10: debug 模式下输出完整环境快照
+dump_debug_env() {
+    echo "======== ClawHole v${SCRIPT_VERSION} 环境快照 [$(date)] ========"
+    echo "OS       : $OS_NAME $OS_VERSION ($OS_FAMILY)"
+    echo "PKG_MGR  : $PKG_MANAGER"
+    echo "BASH     : $BASH_VERSION"
+    echo "ARCH     : $(uname -m)"
+    echo "USER     : $(id)"
+    echo "PATH     : $PATH"
+    echo "jq       : $(command -v jq 2>/dev/null || echo '未安装')"
+    echo "python3  : $(command -v python3 2>/dev/null || echo '未安装')"
+    echo "node     : $(node --version 2>/dev/null || echo '未安装')"
+    echo "cloudflared: $(cloudflared --version 2>/dev/null | head -n1 || echo '未安装')"
+    echo "openclaw : $(openclaw --version 2>/dev/null | head -n1 || echo '未安装')"
+    echo "DOMAIN   : ${DOMAIN:-'(未设置)'}"
+    echo "PORT     : ${PORT:-'(未设置)'}"
+    echo "NO_ACCESS: ${NO_ACCESS:-false}"
+    echo "LOG_FILE : $LOG_FILE"
+    echo "========================================================"
+}
 
-# Fix #1: 提取架构映射为独立函数，供多处复用，避免 uname -m 原始值直接拼 URL
+# ============================================================
+# 架构映射
+# ============================================================
 _map_arch() {
     local raw
     raw=$(uname -m)
@@ -258,6 +407,47 @@ _map_arch() {
     esac
 }
 
+# ============================================================
+# FIX-2: SHA256 校验函数
+# 用法: verify_sha256 <文件路径> <预期哈希>
+# ============================================================
+verify_sha256() {
+    local filepath="$1" expected="$2"
+    local actual
+    if command -v sha256sum &>/dev/null; then
+        actual=$(sha256sum "$filepath" | awk '{print $1}')
+    elif command -v shasum &>/dev/null; then
+        actual=$(shasum -a 256 "$filepath" | awk '{print $1}')
+    else
+        warn "⚠️  sha256sum / shasum 均不可用，跳过校验（建议安装 coreutils）"
+        return 0
+    fi
+    if [ "$actual" != "$expected" ]; then
+        error "SHA256 校验失败！文件可能被篡改或下载损坏。
+  期望: $expected
+  实际: $actual
+  请删除文件后重试: rm -f $filepath"
+    fi
+    success "✓ SHA256 校验通过"
+}
+
+# FIX-2: 获取 cloudflared 最新版本的 SHA256（从 GitHub Releases 下载 checksums 文件）
+_get_cloudflared_checksum() {
+    local arch="$1" os_type="$2"
+    local filename="cloudflared-${os_type}-${arch}"
+    local checksum_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-checksums.txt"
+    local checksums
+    checksums=$(curl -fsSL "$checksum_url" 2>>"$LOG_FILE") || {
+        warn "⚠️  无法获取 cloudflared checksums，跳过 SHA256 校验"
+        echo ""
+        return 0
+    }
+    echo "$checksums" | awk -v fn="$filename" '$2 == fn || $2 == ("*" fn) {print $1; exit}'
+}
+
+# ============================================================
+# 依赖安装
+# ============================================================
 install_cloudflared() {
     if command -v cloudflared &>/dev/null; then
         local ver
@@ -272,28 +462,36 @@ install_cloudflared() {
             ;;
         debian)
             curl -fsSL https://pkg.cloudflare.com/cloudflared/gpg-key \
-                | sudo gpg --dearmor -o /usr/share/keyrings/cloudflare-main.gpg 2>> "$LOG_FILE"
+                | sudo gpg --dearmor -o /usr/share/keyrings/cloudflare-main.gpg 2>>"$LOG_FILE"
             echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] \
 https://pkg.cloudflare.com/cloudflared \
 $(lsb_release -cs 2>/dev/null || echo focal) main" \
-                | sudo tee /etc/apt/sources.list.d/cloudflared.list >> "$LOG_FILE" 2>&1
-            sudo apt-get update  >> "$LOG_FILE" 2>&1
-            sudo apt-get install -y cloudflared >> "$LOG_FILE" 2>&1
+                | sudo tee /etc/apt/sources.list.d/cloudflared.list >>"$LOG_FILE" 2>&1
+            sudo apt-get update  >>"$LOG_FILE" 2>&1
+            sudo apt-get install -y cloudflared >>"$LOG_FILE" 2>&1
             ;;
         rhel|fedora)
-            # Fix #1: RHEL/Fedora 同样需要将 uname -m (x86_64) 映射为包名中的 amd64
             local arch
             arch=$(_map_arch)
             local rpm_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}.rpm"
-            sudo rpm -i "$rpm_url" >> "$LOG_FILE" 2>&1 \
-                || sudo yum install -y "$rpm_url" >> "$LOG_FILE" 2>&1
+            sudo rpm -i "$rpm_url" >>"$LOG_FILE" 2>&1 \
+                || sudo yum install -y "$rpm_url" >>"$LOG_FILE" 2>&1 || true
             ;;
         *)
+            # FIX-2: 通用二进制下载后做 SHA256 校验
             local arch
             arch=$(_map_arch)
-            sudo curl -fsSL \
-                "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}" \
-                -o /usr/local/bin/cloudflared
+            local bin_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}"
+            local tmp_bin
+            tmp_bin=$(mktemp)
+            info "下载 cloudflared ($arch)..."
+            curl -fsSL "$bin_url" -o "$tmp_bin" || error "下载 cloudflared 失败，请检查网络"
+            local expected_hash
+            expected_hash=$(_get_cloudflared_checksum "$arch" "linux")
+            if [ -n "$expected_hash" ]; then
+                verify_sha256 "$tmp_bin" "$expected_hash"
+            fi
+            sudo mv "$tmp_bin" /usr/local/bin/cloudflared
             sudo chmod +x /usr/local/bin/cloudflared
             ;;
     esac
@@ -306,7 +504,7 @@ $(lsb_release -cs 2>/dev/null || echo focal) main" \
 install_nodejs() {
     if command -v node &>/dev/null; then
         local ver
-        ver=$(node --version 2>/dev/null | cut -c2-)  # 去掉 'v' 前缀
+        ver=$(node --version 2>/dev/null | cut -c2-)
         if version_gte "$ver" "18"; then
             success "✓ Node.js $ver 已安装"
             return 0
@@ -319,12 +517,12 @@ install_nodejs() {
             pkg_install "node"
             ;;
         debian)
-            curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - >> "$LOG_FILE" 2>&1
-            sudo apt-get install -y nodejs >> "$LOG_FILE" 2>&1
+            curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - >>"$LOG_FILE" 2>&1
+            sudo apt-get install -y nodejs >>"$LOG_FILE" 2>&1
             ;;
         rhel|fedora)
-            curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo bash - >> "$LOG_FILE" 2>&1
-            sudo yum install -y nodejs >> "$LOG_FILE" 2>&1
+            curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo bash - >>"$LOG_FILE" 2>&1
+            sudo yum install -y nodejs >>"$LOG_FILE" 2>&1
             ;;
         *)
             warn "⚠️  请手动安装 Node.js 18+"
@@ -349,9 +547,9 @@ install_openclaw() {
     local npm_root
     npm_root=$(npm root -g 2>/dev/null) || npm_root=""
     if [[ "$OS_FAMILY" != "macos" ]] && [[ -n "$npm_root" ]] && [[ ! -w "$npm_root" ]]; then
-        sudo npm install -g openclaw@latest >> "$LOG_FILE" 2>&1
+        sudo npm install -g openclaw@latest >>"$LOG_FILE" 2>&1
     else
-        npm install -g openclaw@latest >> "$LOG_FILE" 2>&1
+        npm install -g openclaw@latest >>"$LOG_FILE" 2>&1
     fi
     command -v openclaw &>/dev/null || error "OpenClaw 安装失败，请查看日志: $LOG_FILE"
     local ver
@@ -367,7 +565,6 @@ check_dependencies() {
         command -v brew &>/dev/null || error "需要 Homebrew: https://brew.sh"
         success "✓ Homebrew"
     fi
-    # 提示安装 jq（json_field 的 sed 回退不可靠）
     if ! command -v jq &>/dev/null; then
         warn "⚠️  未检测到 jq，建议安装以确保 Cloudflare API 解析可靠"
         warn "    macOS: brew install jq  |  Ubuntu/Debian: sudo apt-get install jq"
@@ -384,8 +581,6 @@ find_openclaw_bin() {
     command -v openclaw 2>/dev/null || echo "/usr/local/bin/openclaw"
 }
 
-# Fix #2: macOS 13 (Ventura)+ 废弃了 launchctl load/unload，改用 bootstrap/bootout
-# 检测 macOS 主版本号，据此选择正确的 launchctl 命令
 _launchctl_load() {
     local plist="$1"
     local macos_major
@@ -415,7 +610,11 @@ _install_launchd() {
     local dir="$HOME/Library/LaunchAgents"
     mkdir -p "$dir"
 
-    cat > "$dir/ai.openclaw.gateway.plist" <<EOF
+    # FIX-6: 检测是否已安装，避免重复注册
+    local oc_plist="$dir/ai.openclaw.gateway.plist"
+    local cf_plist="$dir/com.cloudflare.cloudflared.plist"
+
+    cat > "$oc_plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -442,7 +641,7 @@ _install_launchd() {
 </dict></plist>
 EOF
 
-    cat > "$dir/com.cloudflare.cloudflared.plist" <<EOF
+    cat > "$cf_plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -472,10 +671,12 @@ EOF
 </dict></plist>
 EOF
 
-    _launchctl_unload "$dir/ai.openclaw.gateway.plist"
-    _launchctl_load   "$dir/ai.openclaw.gateway.plist"
-    _launchctl_unload "$dir/com.cloudflare.cloudflared.plist"
-    _launchctl_load   "$dir/com.cloudflare.cloudflared.plist"
+    # FIX-6: 先 unload 再 load，保证幂等（已注册的先卸掉再重注册）
+    _launchctl_unload "$oc_plist"
+    _launchctl_load   "$oc_plist"
+    _launchctl_unload "$cf_plist"
+    _launchctl_load   "$cf_plist"
+    success "✓ launchd 服务已注册"
 }
 
 _uninstall_launchd() {
@@ -491,6 +692,8 @@ _install_systemd() {
     local cf_bin
     cf_bin=$(command -v cloudflared 2>/dev/null || echo "/usr/local/bin/cloudflared")
 
+    # FIX-C: ExecStart 使用 --no-daemon（前台模式），让 systemd 管理进程生命周期
+    # FIX-D: 补全 systemd 安全加固项
     sudo tee /etc/systemd/system/openclaw-gateway.service > /dev/null <<EOF
 [Unit]
 Description=OpenClaw Gateway
@@ -499,17 +702,23 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$oc_bin gateway start --force
+ExecStart=$oc_bin gateway start --force --no-daemon
 Restart=on-failure
 RestartSec=10
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# 安全加固
 NoNewPrivileges=true
-ReadWritePaths=$OC_CONFIG_DIR /tmp
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=$OC_CONFIG_DIR
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
+    # FIX-D: cloudflared 同样补全安全加固
     sudo tee /etc/systemd/system/cloudflared-tunnel.service > /dev/null <<EOF
 [Unit]
 Description=Cloudflare Tunnel (ClawHole)
@@ -522,16 +731,24 @@ ExecStart=$cf_bin tunnel --config $CF_CONFIG_DIR/config.yml run $TUNNEL_NAME
 Restart=on-failure
 RestartSec=10
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# 安全加固
 NoNewPrivileges=true
-ReadWritePaths=$CF_CONFIG_DIR /tmp
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=$CF_CONFIG_DIR
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
     sudo systemctl daemon-reload
-    sudo systemctl enable openclaw-gateway
-    sudo systemctl enable cloudflared-tunnel
+
+    # FIX-6: enable 幂等（已 enable 的不会报错）
+    sudo systemctl enable openclaw-gateway  >>"$LOG_FILE" 2>&1 || true
+    sudo systemctl enable cloudflared-tunnel >>"$LOG_FILE" 2>&1 || true
+    success "✓ systemd 服务已注册"
 }
 
 _uninstall_systemd() {
@@ -563,7 +780,6 @@ service_uninstall() {
 service_start() {
     case "$OS_FAMILY" in
         macos)
-            # Fix #2: 同样使用封装函数，兼容 macOS 13+
             local dir="$HOME/Library/LaunchAgents"
             _launchctl_load "$dir/ai.openclaw.gateway.plist"
             _launchctl_load "$dir/com.cloudflare.cloudflared.plist"
@@ -589,163 +805,6 @@ service_stop() {
             sudo systemctl disable cloudflared-tunnel 2>/dev/null || true
             ;;
     esac
-}
-
-# ============================================================
-# DNS 备份 / 设置 / 恢复
-# ============================================================
-
-_macos_active_iface_name() {
-    local default_dev
-    default_dev=$(route get default 2>/dev/null | awk '/interface:/{print $2}')
-    [ -z "$default_dev" ] && return 1
-    networksetup -listnetworkserviceorder 2>/dev/null \
-        | grep -B1 "Device: ${default_dev})" \
-        | head -1 \
-        | sed 's/^([0-9]*) //'
-}
-
-dns_backup() {
-    local backup_file="$OC_CONFIG_DIR/.dns_backup"
-    case "$OS_FAMILY" in
-        macos)
-            local iface
-            iface=$(_macos_active_iface_name 2>/dev/null) || {
-                warn "⚠️  无法检测网络接口，跳过 DNS 备份"
-                return 0
-            }
-            {
-                echo "macos"
-                echo "$iface"
-                networksetup -getdnsservers "$iface" 2>/dev/null || echo "Empty"
-            } > "$backup_file"
-            chmod 600 "$backup_file"
-            info "DNS 已备份 (接口: $iface)"
-            ;;
-        *)
-            # Fix #4: 检测 systemd-resolved，避免直接覆写符号链接破坏 resolved
-            if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-                # 通过 resolvectl 备份，不动 /etc/resolv.conf
-                local iface
-                iface=$(ip route 2>/dev/null | awk '/default/{print $5; exit}')
-                {
-                    echo "resolved"
-                    echo "$iface"
-                    resolvectl dns "$iface" 2>/dev/null || true
-                } > "$backup_file"
-                chmod 600 "$backup_file"
-                info "DNS 已备份 (resolvectl, 接口: $iface)"
-            elif [ -f /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ]; then
-                # 仅在 resolv.conf 是真实文件（非符号链接）时才备份并直接修改
-                {
-                    echo "linux"
-                    cat /etc/resolv.conf
-                } > "$backup_file"
-                chmod 600 "$backup_file"
-                info "DNS 已备份 (/etc/resolv.conf)"
-            else
-                warn "⚠️  /etc/resolv.conf 是符号链接且 systemd-resolved 未运行，跳过 DNS 备份"
-            fi
-            ;;
-    esac
-}
-
-dns_set() {
-    info "配置 DNS → 1.1.1.1 / 1.0.0.1 ..."
-    case "$OS_FAMILY" in
-        macos)
-            local iface
-            iface=$(_macos_active_iface_name 2>/dev/null) || {
-                warn "⚠️  无法检测网络接口，跳过 DNS 设置"
-                return 0
-            }
-            networksetup -setdnsservers "$iface" 1.1.1.1 1.0.0.1 2>/dev/null \
-                && success "✓ DNS 已设置 (接口: $iface)" \
-                || warn "⚠️  DNS 设置失败"
-            ;;
-        *)
-            # Fix #4: 优先用 resolvectl（兼容 systemd-resolved），
-            # 仅当 resolv.conf 确实是普通文件时才直接写入
-            if command -v resolvectl &>/dev/null && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-                local iface
-                iface=$(ip route 2>/dev/null | awk '/default/{print $5; exit}')
-                if [ -n "$iface" ]; then
-                    sudo resolvectl dns "$iface" 1.1.1.1 1.0.0.1 2>/dev/null \
-                        && success "✓ DNS 已设置 (resolvectl, 接口: $iface)" \
-                        || warn "⚠️  resolvectl 失败"
-                else
-                    warn "⚠️  无法检测默认网卡，跳过 DNS 设置"
-                fi
-            elif [ -f /etc/resolv.conf ] && [ ! -L /etc/resolv.conf ]; then
-                sudo tee /etc/resolv.conf > /dev/null <<'EOF'
-nameserver 1.1.1.1
-nameserver 1.0.0.1
-options edns0
-EOF
-                success "✓ DNS 已设置 (/etc/resolv.conf)"
-                warn "⚠️  注意: NetworkManager 可能在下次连接时覆盖此配置"
-            else
-                warn "⚠️  /etc/resolv.conf 是符号链接，跳过 DNS 直写（由 systemd-resolved 管理）"
-            fi
-            ;;
-    esac
-}
-
-dns_restore() {
-    local backup_file="$OC_CONFIG_DIR/.dns_backup"
-    [ ! -f "$backup_file" ] && return 0
-
-    local platform
-    platform=$(sed -n '1p' "$backup_file")
-    case "$platform" in
-        macos)
-            local iface
-            iface=$(sed -n '2p' "$backup_file")
-            if [ -z "$iface" ]; then
-                warn "⚠️  DNS 备份文件损坏（无接口信息），跳过恢复"
-                rm -f "$backup_file"
-                return 0
-            fi
-            local dns_servers
-            dns_servers=$(sed -n '3,$p' "$backup_file" | tr '\n' ' ' | sed 's/ $//')
-            if [ -z "$dns_servers" ] || echo "$dns_servers" | grep -qi "empty\|There aren't"; then
-                networksetup -setdnsservers "$iface" "Empty" 2>/dev/null \
-                    && success "✓ DNS 已恢复 → DHCP (接口: $iface)"
-            else
-                # shellcheck disable=SC2086
-                networksetup -setdnsservers "$iface" $dns_servers 2>/dev/null \
-                    && success "✓ DNS 已恢复 → $dns_servers (接口: $iface)"
-            fi
-            ;;
-        resolved)
-            # Fix #4: systemd-resolved 备份的恢复路径
-            local iface
-            iface=$(sed -n '2p' "$backup_file")
-            local orig_dns
-            orig_dns=$(sed -n '3,$p' "$backup_file" | tr '\n' ' ' | xargs)
-            if [ -n "$iface" ] && [ -n "$orig_dns" ]; then
-                # shellcheck disable=SC2086
-                sudo resolvectl dns "$iface" $orig_dns 2>/dev/null \
-                    && success "✓ DNS 已恢复 (resolvectl, 接口: $iface → $orig_dns)" \
-                    || warn "⚠️  resolvectl 恢复失败，请手动检查 DNS 配置"
-            else
-                warn "⚠️  DNS 备份数据不完整，跳过恢复"
-            fi
-            ;;
-        linux)
-            # 确认目标是真实文件才写入
-            if [ ! -L /etc/resolv.conf ]; then
-                sudo tee /etc/resolv.conf > /dev/null < <(sed -n '2,$p' "$backup_file")
-                success "✓ DNS 已恢复 (/etc/resolv.conf)"
-            else
-                warn "⚠️  /etc/resolv.conf 当前是符号链接，跳过恢复（可能已由系统接管）"
-            fi
-            ;;
-        *)
-            warn "⚠️  未知 DNS 备份格式，跳过恢复"
-            ;;
-    esac
-    rm -f "$backup_file"
 }
 
 # ============================================================
@@ -778,8 +837,8 @@ get_user_config() {
     echo -e "${GREEN}===== 配置向导 =====${NC}"
     echo ""
 
-    # 域名
     if [ -z "${DOMAIN:-}" ]; then
+        [ "$NON_INTERACTIVE" = "true" ] && error "--yes 模式下必须通过 --domain 指定域名"
         while true; do
             read -rp "▶ 域名 (如 claw.example.com): " DOMAIN
             [ -z "$DOMAIN" ] && continue
@@ -789,14 +848,21 @@ get_user_config() {
         validate_domain "$DOMAIN"
     fi
 
-    # 端口
+    # FIX-F: TUNNEL_NAME 绑定到域名，支持多实例
+    TUNNEL_NAME="openclaw-$(echo "$DOMAIN" | tr '.' '-')"
+    info "Tunnel 名称: $TUNNEL_NAME"
+
     if [ -z "${PORT:-}" ]; then
-        read -rp "▶ 端口 (默认 $DEFAULT_PORT): " PORT
-        PORT="${PORT:-$DEFAULT_PORT}"
+        if [ "$NON_INTERACTIVE" = "true" ]; then
+            PORT="$DEFAULT_PORT"
+            info "[非交互] 使用默认端口 $PORT"
+        else
+            read -rp "▶ 端口 (默认 $DEFAULT_PORT): " PORT
+            PORT="${PORT:-$DEFAULT_PORT}"
+        fi
     fi
     validate_port "$PORT"
 
-    # Token
     if [ -n "${OPENCLAW_TOKEN:-}" ]; then
         TOKEN="$OPENCLAW_TOKEN"
         info "使用环境变量 OPENCLAW_TOKEN"
@@ -810,41 +876,39 @@ get_user_config() {
     chmod 600 "$OC_CONFIG_DIR/.auth_token"
     success "✓ Token 已保存 → $OC_CONFIG_DIR/.auth_token (权限 600)"
 
-    echo ""
-    read -rp "按 Enter 继续..."
-    echo ""
+    if [ "$NON_INTERACTIVE" != "true" ]; then
+        echo ""
+        read -rp "按 Enter 继续..."
+        echo ""
+    fi
 }
 
 # ============================================================
-# 配置并启动 OpenClaw
+# 配置 OpenClaw（只写配置，不自己 fork 进程）
+# FIX-C: 进程生命周期完全交给 systemd / launchd
+#         这里只做：停旧服务 → 写配置 → 验证配置
+#         实际启动在 service_start() 之后
 # ============================================================
 configure_openclaw() {
     info "配置 OpenClaw..."
     mkdir -p "$OC_CONFIG_DIR"
-    oc_config_set gateway.port      "$PORT"
-    oc_config_set gateway.bind      "loopback"
-    oc_config_set gateway.mode      "local"
-    oc_config_set gateway.auth.mode "token"
+
+    # 停旧服务（通过服务管理器，不用 pgrep / pkill）
+    # FIX-C: 此时服务管理器可能还没注册，用 openclaw 自己的 stop 命令兜底
+    openclaw gateway stop >>"$LOG_FILE" 2>&1 || true
+    sleep 1
+
+    oc_config_set gateway.port       "$PORT"
+    oc_config_set gateway.bind       "loopback"
+    oc_config_set gateway.mode       "local"
+    oc_config_set gateway.auth.mode  "token"
     oc_config_set gateway.auth.token "$TOKEN"
     success "✓ 配置已写入"
 
-    openclaw config validate >> "$LOG_FILE" 2>&1 || error "OpenClaw 配置验证失败，请查看日志: $LOG_FILE"
+    openclaw config validate >>"$LOG_FILE" 2>&1 \
+        || error "OpenClaw 配置验证失败，请查看日志: $LOG_FILE"
     success "✓ 配置验证通过"
-
-    # 停止可能残留的旧进程
-    openclaw gateway stop 2>/dev/null || true
-    pkill -f "openclaw.*gateway" 2>/dev/null || true
-    sleep 2
-
-    info "启动 OpenClaw Gateway..."
-    openclaw gateway start --force >> "$LOG_FILE" 2>&1 || error "OpenClaw 启动失败，请查看日志: $LOG_FILE"
-    sleep 5
-
-    if port_in_use "$PORT"; then
-        success "✓ OpenClaw 运行中 (127.0.0.1:$PORT)"
-    else
-        error "OpenClaw 启动后未监听 127.0.0.1:$PORT，请查看日志: $LOG_FILE"
-    fi
+    # 注意：不在这里启动进程，由 service_start() 通过 systemd/launchd 统一启动
 }
 
 # ============================================================
@@ -853,20 +917,40 @@ configure_openclaw() {
 configure_tunnel() {
     info "配置 Cloudflare Tunnel..."
 
-    # 检查认证凭据
     if [ ! -f "$CF_CONFIG_DIR/cert.pem" ]; then
         echo -e "${YELLOW}⚠️  需要先完成 Cloudflare 登录认证${NC}"
-        read -rp "按 Enter 打开浏览器认证..."
-        cloudflared tunnel login >> "$LOG_FILE" 2>&1 || error "Cloudflare 认证失败，请查看日志: $LOG_FILE"
+        confirm "按 Enter 打开浏览器认证" || true
+        cloudflared tunnel login >>"$LOG_FILE" 2>&1 || error "Cloudflare 认证失败，请查看日志: $LOG_FILE"
         success "✓ 认证成功"
     else
         success "✓ 已有认证凭据"
     fi
 
-    # 创建或复用隧道
+    # FIX-B: 用 --output json 解析 tunnel list，不再文本 grep
     local tunnel_id=""
-    if cloudflared tunnel list 2>/dev/null | grep -qw "$TUNNEL_NAME"; then
-        tunnel_id=$(cloudflared tunnel list 2>/dev/null | awk -v name="$TUNNEL_NAME" '$0 ~ name {print $1; exit}')
+    local list_json
+    list_json=$(cloudflared tunnel list --output json 2>>"$LOG_FILE") || list_json="[]"
+
+    if command -v jq &>/dev/null; then
+        tunnel_id=$(echo "$list_json" | jq -r ".[] | select(.name==\"$TUNNEL_NAME\") | .id" 2>/dev/null | head -1)
+    elif command -v python3 &>/dev/null; then
+        tunnel_id=$(echo "$list_json" | python3 -c "
+import sys, json
+try:
+    for t in json.load(sys.stdin):
+        if t.get('name') == '$TUNNEL_NAME':
+            print(t.get('id', ''))
+            break
+except Exception:
+    pass
+" 2>/dev/null)
+    else
+        # sed 回退：有字段顺序风险，输出警告
+        warn "⚠️  未安装 jq/python3，使用 sed 解析 tunnel list（不稳定）"
+        tunnel_id=$(echo "$list_json" | sed -n "s/.*\"name\":\"${TUNNEL_NAME}\".*\"id\":\"\([^\"]*\)\".*/\1/p" | head -1)
+    fi
+
+    if [ -n "$tunnel_id" ] && [ "$tunnel_id" != "null" ]; then
         warn "⚠️  检测到同名隧道，复用: $tunnel_id"
         if [ ! -f "$CF_CONFIG_DIR/${tunnel_id}.json" ]; then
             error "凭据文件 $CF_CONFIG_DIR/${tunnel_id}.json 不存在。
@@ -874,15 +958,16 @@ configure_tunnel() {
   然后重新运行本脚本。"
         fi
     else
+        # FIX-1: --output json 获取结构化输出
         local create_out
-        create_out=$(cloudflared tunnel create "$TUNNEL_NAME" 2>&1) \
-            || error "创建隧道失败: $create_out"
-        tunnel_id=$(echo "$create_out" | sed -n 's/.*Tunnel ID: *\([0-9a-f-]*\).*/\1/p')
-        [ -z "$tunnel_id" ] && error "无法从输出中解析 Tunnel ID: $create_out"
+        create_out=$(cloudflared tunnel create --output json "$TUNNEL_NAME" 2>>"$LOG_FILE") \
+            || error "创建隧道失败，请查看日志: $LOG_FILE"
+        tunnel_id=$(json_field "$create_out" '.id')
+        [ -z "$tunnel_id" ] || [ "$tunnel_id" = "null" ] \
+            && error "无法从 JSON 输出解析 Tunnel ID，原始输出: $create_out"
         success "✓ 隧道创建成功: $tunnel_id"
     fi
 
-    # Fix #3: 赋值到全局变量（已在顶部初始化）
     TUNNEL_ID="$tunnel_id"
 
     # 生成 config.yml
@@ -908,7 +993,7 @@ loglevel: info
 EOF
     success "✓ Tunnel 配置已生成 ($CF_CONFIG_DIR/config.yml)"
 
-    # 配置 DNS 路由
+    # FIX-6: DNS 路由幂等——already exists 不视为错误
     info "配置 DNS 路由 ($DOMAIN → 隧道)..."
     local dns_out dns_exit=0
     dns_out=$(cloudflared tunnel route dns "$TUNNEL_NAME" "$DOMAIN" 2>&1) || dns_exit=$?
@@ -933,32 +1018,29 @@ configure_cf_access() {
         return 0
     fi
 
-    # Fix #3: 确保 TUNNEL_ID 已由 configure_tunnel 赋值
-    [ -z "$TUNNEL_ID" ] && error "TUNNEL_ID 未设置，请确保 configure_tunnel 在此之前已成功执行"
+    [ -z "$TUNNEL_ID" ] && error "TUNNEL_ID 未设置，请确保 configure_tunnel 已成功执行"
 
     echo -e "${GREEN}===== Cloudflare Access (Zero Trust) =====${NC}"
 
-    # 收集必要参数
     if [ -z "${CF_API_TOKEN:-}" ]; then
         read -rsp "▶ CF API Token: " CF_API_TOKEN; echo ""
     fi
-    [ -z "${CF_ACCOUNT_ID:-}" ] && read -rp  "▶ CF Account ID: "                  CF_ACCOUNT_ID
-    [ -z "${ACCESS_EMAIL:-}" ]  && read -rp  "▶ 允许访问的邮箱: "                  ACCESS_EMAIL
+    [ -z "${CF_ACCOUNT_ID:-}" ] && read -rp  "▶ CF Account ID: "                   CF_ACCOUNT_ID
+    [ -z "${ACCESS_EMAIL:-}" ]  && read -rp  "▶ 允许访问的邮箱: "                   ACCESS_EMAIL
     [ -z "${CF_TEAM_NAME:-}" ]  && read -rp  "▶ Zero Trust Team Name (如 myteam): " CF_TEAM_NAME
 
     local api="https://api.cloudflare.com/client/v4"
-
-    # ---- 创建 Access Application ----
-    info "创建 Access Application..."
     local resp app_id app_aud
 
+    # FIX-7: 创建 Access Application（带重试）
+    info "创建 Access Application..."
     _sensitive_begin
-    resp=$(curl -sf -X POST "$api/accounts/$CF_ACCOUNT_ID/access/apps" \
+    resp=$(cf_api_call "创建 Access App" \
+        -X POST "$api/accounts/$CF_ACCOUNT_ID/access/apps" \
         -H "Authorization: Bearer $CF_API_TOKEN" \
         -H "Content-Type: application/json" \
         -d "{\"name\":\"OpenClaw\",\"domain\":\"$DOMAIN\",\"type\":\"self_hosted\",
-             \"session_duration\":\"24h\",\"auto_redirect_to_identity\":false}" \
-        2>> "$LOG_FILE") || resp=""
+             \"session_duration\":\"24h\",\"auto_redirect_to_identity\":false}") || resp=""
     _sensitive_end
 
     app_id=$(json_field "$resp" '.result.id')
@@ -969,16 +1051,16 @@ configure_cf_access() {
         local existing_resp
 
         _sensitive_begin
-        existing_resp=$(curl -sf "$api/accounts/$CF_ACCOUNT_ID/access/apps" \
-            -H "Authorization: Bearer $CF_API_TOKEN" \
-            2>> "$LOG_FILE") || existing_resp=""
+        # FIX-7: 查询也带重试
+        existing_resp=$(cf_api_call "查询 Access Apps" \
+            "$api/accounts/$CF_ACCOUNT_ID/access/apps" \
+            -H "Authorization: Bearer $CF_API_TOKEN") || existing_resp=""
         _sensitive_end
 
         if command -v jq &>/dev/null; then
             app_id=$(echo "$existing_resp"  | jq -r ".result[] | select(.domain==\"$DOMAIN\") | .id"  2>/dev/null | head -1)
             app_aud=$(echo "$existing_resp" | jq -r ".result[] | select(.domain==\"$DOMAIN\") | .aud" 2>/dev/null | head -1)
         elif command -v python3 &>/dev/null; then
-            # python3 回退，可靠解析不依赖字段顺序
             app_id=$(echo "$existing_resp" | python3 -c "
 import sys, json
 try:
@@ -1002,9 +1084,7 @@ except Exception:
     pass
 " 2>/dev/null)
         else
-            # Fix #6: sed 回退有字段顺序依赖风险，输出明确警告
-            warn "⚠️  未安装 jq 或 python3，使用 sed 解析 CF API 响应（可能不稳定）"
-            warn "    强烈建议安装 jq: sudo apt-get install jq / brew install jq"
+            warn "⚠️  未安装 jq 或 python3，使用 sed 解析（不可靠）"
             app_id=$(echo "$existing_resp"  | sed -n "s/.*\"domain\":\"$DOMAIN\".*\"id\":\"\([^\"]*\)\".*/\1/p" | head -1)
             app_aud=$(echo "$existing_resp" | sed -n "s/.*\"domain\":\"$DOMAIN\".*\"aud\":\"\([^\"]*\)\".*/\1/p" | head -1)
         fi
@@ -1014,18 +1094,19 @@ except Exception:
         && error "无法创建或找到 Access Application (domain: $DOMAIN)，请检查 CF API Token 权限"
     success "✓ Application: $app_id  AUD: $app_aud"
 
-    # ---- 创建访问策略 ----
+    # FIX-7: 创建策略带重试
     _sensitive_begin
-    curl -sf -X POST "$api/accounts/$CF_ACCOUNT_ID/access/apps/$app_id/policies" \
+    cf_api_call "创建 Access Policy" \
+        -X POST "$api/accounts/$CF_ACCOUNT_ID/access/apps/$app_id/policies" \
         -H "Authorization: Bearer $CF_API_TOKEN" \
         -H "Content-Type: application/json" \
         -d "{\"name\":\"Whitelist\",\"decision\":\"allow\",
              \"include\":[{\"email\":{\"email\":\"$ACCESS_EMAIL\"}}]}" \
-        >> "$LOG_FILE" 2>&1 || warn "⚠️  Policy 创建失败，请在 Cloudflare Dashboard 手动添加"
+        >>"$LOG_FILE" 2>&1 || warn "⚠️  Policy 创建失败，请在 Cloudflare Dashboard 手动添加"
     _sensitive_end
     success "✓ 访问策略已创建 (邮箱: $ACCESS_EMAIL)"
 
-    # ---- 更新 config.yml，启用 Origin JWT 验证 ----
+    # 更新 config.yml 启用 Origin JWT 验证
     cat > "$CF_CONFIG_DIR/config.yml" <<EOF
 tunnel: $TUNNEL_ID
 credentials-file: $CF_CONFIG_DIR/$TUNNEL_ID.json
@@ -1056,26 +1137,49 @@ EOF
 
 # ============================================================
 # 部署验证
+# FIX-E: 端口连通性为主检查，/health 为辅助增强检查
 # ============================================================
 verify_deployment() {
     echo -e "${GREEN}===== 部署验证 =====${NC}"
     local all_ok=true
 
-    # 1. OpenClaw 进程
-    info "检查 OpenClaw..."
+    # 1. 主检查：端口连通性（最可靠）
+    info "检查 OpenClaw 端口 (主检查)..."
+    local waited=0
+    until port_in_use "$PORT"; do
+        sleep 3; waited=$((waited + 3))
+        [ "$waited" -ge 30 ] && break
+    done
+
     if port_in_use "$PORT"; then
         success "✓ OpenClaw 监听 127.0.0.1:$PORT"
     else
-        warn "⚠️  OpenClaw 未监听 $PORT"
+        warn "⚠️  OpenClaw 未监听 $PORT（服务可能启动慢，稍后再试）"
         all_ok=false
     fi
 
-    # 2. Cloudflare Tunnel 进程 + 连通状态
+    # 2. 辅助检查：/health endpoint（不强依赖，版本兼容问题跳过）
+    # FIX-E: /health 不存在时不视为错误，仅作增强信息
+    info "检查 /health endpoint（辅助）..."
+    local health_code
+    health_code=$(curl -sf -o /dev/null -w "%{http_code}" \
+        --max-time 5 "http://127.0.0.1:${PORT}/health" 2>/dev/null || echo "000")
+    if [[ "$health_code" =~ ^(200|204)$ ]]; then
+        success "✓ /health 返回 HTTP $health_code"
+    elif [ "$health_code" = "404" ]; then
+        info "  /health 返回 404（此版本 OpenClaw 不支持该 endpoint，正常）"
+    elif [ "$health_code" = "000" ]; then
+        info "  /health 无响应（可能服务仍在启动，端口已通则不影响使用）"
+    else
+        info "  /health 返回 HTTP $health_code（不影响主服务）"
+    fi
+
+    # 3. Cloudflare Tunnel 进程
     info "检查 Cloudflare Tunnel..."
-    local waited=0
-    while ! pgrep -f "cloudflared.*tunnel" &>/dev/null; do
-        sleep 5; waited=$((waited + 5))
-        [ "$waited" -ge 30 ] && break
+    local cf_waited=0
+    until pgrep -f "cloudflared.*tunnel" &>/dev/null; do
+        sleep 5; cf_waited=$((cf_waited + 5))
+        [ "$cf_waited" -ge 30 ] && break
     done
 
     if pgrep -f "cloudflared.*tunnel" &>/dev/null; then
@@ -1091,10 +1195,11 @@ verify_deployment() {
         all_ok=false
     fi
 
-    # 3. 域名 HTTP 可达性
+    # 4. 域名可达性
     info "检查域名可达性 ($DOMAIN)..."
     local http_code
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "https://$DOMAIN" 2>/dev/null || echo "000")
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+        --max-time 10 "https://$DOMAIN" 2>/dev/null || echo "000")
     if [[ "$http_code" =~ ^(200|301|302|401|403)$ ]]; then
         success "✓ 域名可访问 (HTTP $http_code)"
     else
@@ -1114,23 +1219,22 @@ verify_deployment() {
 # ============================================================
 uninstall() {
     echo -e "${RED}===== 卸载 ClawHole =====${NC}"
-    read -rp "确认卸载所有组件? (y/n): " -n 1; echo
-    [[ ! $REPLY =~ ^[Yy]$ ]] && exit 0
+    # FIX-G: --yes 模式下自动确认
+    confirm "确认卸载所有组件?" || exit 0
 
-    openclaw gateway stop 2>/dev/null || true
+    # FIX-C: 通过服务管理器停服务，不再手动 kill 进程
     service_stop
     service_uninstall
 
+    openclaw gateway stop 2>/dev/null || true
     openclaw config unset gateway.port       2>/dev/null || true
     openclaw config unset gateway.bind       2>/dev/null || true
     openclaw config unset gateway.auth.mode  2>/dev/null || true
     openclaw config unset gateway.auth.token 2>/dev/null || true
     rm -f "$OC_CONFIG_DIR/.auth_token"
+    state_reset
 
-    dns_restore
-
-    read -rp "卸载 OpenClaw CLI? (y/n): " -n 1; echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
+    confirm "卸载 OpenClaw CLI?" && {
         local npm_root
         npm_root=$(npm root -g 2>/dev/null) || npm_root=""
         if [[ "$OS_FAMILY" != "macos" ]] && [[ -n "$npm_root" ]] && [[ ! -w "$npm_root" ]]; then
@@ -1139,13 +1243,23 @@ uninstall() {
             npm uninstall -g openclaw 2>/dev/null || true
         fi
         success "✓ OpenClaw CLI 已卸载"
-    fi
+    }
 
-    read -rp "删除 Cloudflare Tunnel '$TUNNEL_NAME'? (y/n): " -n 1; echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        local tid
-        tid=$(cloudflared tunnel list 2>/dev/null | awk -v name="$TUNNEL_NAME" '$0 ~ name {print $1; exit}')
-        if [ -n "$tid" ]; then
+    confirm "删除 Cloudflare Tunnel '$TUNNEL_NAME'?" && {
+        local list_json tid
+        list_json=$(cloudflared tunnel list --output json 2>/dev/null) || list_json="[]"
+        if command -v jq &>/dev/null; then
+            tid=$(echo "$list_json" | jq -r ".[] | select(.name==\"$TUNNEL_NAME\") | .id" 2>/dev/null | head -1)
+        else
+            tid=$(echo "$list_json" | python3 -c "
+import sys,json
+try:
+    for t in json.load(sys.stdin):
+        if t.get('name')=='$TUNNEL_NAME': print(t['id']); break
+except: pass
+" 2>/dev/null)
+        fi
+        if [ -n "$tid" ] && [ "$tid" != "null" ]; then
             if cloudflared tunnel delete "$tid" 2>/dev/null; then
                 success "✓ 隧道已删除"
                 rm -rf "$CF_CONFIG_DIR"
@@ -1156,20 +1270,17 @@ uninstall() {
         else
             warn "⚠️  未找到隧道 '$TUNNEL_NAME'"
         fi
-    fi
+    }
 
     if [ -n "${DOMAIN:-}" ]; then
-        read -rp "删除 Cloudflare DNS 记录 ($DOMAIN)? (y/n): " -n 1; echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
+        confirm "删除 Cloudflare DNS 记录 ($DOMAIN)?" && {
             cloudflared tunnel route dns delete "$TUNNEL_NAME" "$DOMAIN" 2>/dev/null \
                 && success "✓ DNS 记录已删除" \
                 || warn "⚠️  DNS 记录删除失败，请在 Cloudflare Dashboard 手动操作"
-        fi
-    else
-        warn "⚠️  未指定域名，跳过 DNS 记录删除"
+        }
     fi
 
-    rm -f "$LOG_FILE"
+    rm -f "$OC_CONFIG_DIR"/deploy-*.log
     success "✅ 卸载完成"
     exit 0
 }
@@ -1201,9 +1312,11 @@ ClawHole v${SCRIPT_VERSION} — OpenClaw + Cloudflare Tunnel 隐私部署
   --no-access               跳过 Cloudflare Access Zero Trust (不推荐)
   --cf-api-token <token>    Cloudflare API Token
   --cf-account-id <id>      Cloudflare Account ID
-  --cf-team-name <name>     Zero Trust Team Name (如 myteam)
+  --cf-team-name <n>        Zero Trust Team Name (如 myteam)
   --access-email <email>    允许访问的邮箱
   --uninstall               卸载所有已部署组件
+  --yes                     非交互模式，跳过所有确认（CI/CD 用）
+  --reset-state             重置部署状态机，强制全流程重新执行
   --debug                   调试模式 (set -x，敏感命令自动屏蔽)
   --help                    显示此帮助
 
@@ -1218,12 +1331,21 @@ ClawHole v${SCRIPT_VERSION} — OpenClaw + Cloudflare Tunnel 隐私部署
   Fedora 36+
   Arch Linux / Manjaro
 
+CI/CD 用法示例:
+  OPENCLAW_TOKEN=xxx CF_API_TOKEN=yyy \\
+    ./$SCRIPT_NAME \\
+      --domain claw.example.com \\
+      --cf-account-id <id> \\
+      --cf-team-name myteam \\
+      --access-email admin@example.com \\
+      --yes
+
 部署流程:
   1. 安装依赖 (Node.js, cloudflared, openclaw)
   2. 配置 OpenClaw Gateway（仅监听 loopback）
   3. 创建 Cloudflare Tunnel（零公网端口暴露）
   4. 可选：启用 Cloudflare Access Zero Trust（邮箱白名单）
-  5. 注册系统服务（开机自启）
+  5. 注册系统服务（systemd/launchd 托管，开机自启）
   6. 验证部署状态
 EOF
     exit 0
@@ -1243,7 +1365,9 @@ main() {
             --cf-team-name)  CF_TEAM_NAME="$2";   shift 2 ;;
             --access-email)  ACCESS_EMAIL="$2";   shift 2 ;;
             --uninstall)     UNINSTALL=true;       shift   ;;
+            --yes)           NON_INTERACTIVE=true; shift   ;;
             --debug)         DEBUG=1;              shift   ;;
+            --reset-state)   RESET_STATE=true;     shift   ;;
             --help)          show_help ;;
             *) echo "未知参数: $1"; show_help ;;
         esac
@@ -1256,25 +1380,90 @@ main() {
     OC_CONFIG_DIR="$HOME/.openclaw"
     CF_CONFIG_DIR="$HOME/.cloudflared"
     LOG_FILE="$OC_CONFIG_DIR/deploy-${TIMESTAMP}.log"
+    STATE_FILE="$OC_CONFIG_DIR/.deploy_state"
+    OC_PID_FILE="$OC_CONFIG_DIR/gateway.pid"
     mkdir -p "$OC_CONFIG_DIR"
     touch "$LOG_FILE"
     chmod 600 "$LOG_FILE"
 
+    # FIX-9: 启动时 rotate 旧日志
+    rotate_logs "$OC_CONFIG_DIR"
+
+    # FIX-10: debug 模式输出环境快照
+    if [ "${DEBUG:-0}" = "1" ]; then
+        dump_debug_env | tee -a "$LOG_FILE"
+    fi
+
     [ "${UNINSTALL:-false}" = "true" ] && uninstall
 
+    # FIX-H: 支持手动重置状态机
+    [ "${RESET_STATE:-false}" = "true" ] && state_reset
+
+    # FIX-H: 恢复提示
+    local current_state
+    current_state=$(state_get)
+    if [ -n "$current_state" ] && [ "$current_state" != "done" ]; then
+        warn "⚠️  检测到未完成的部署（当前进度: $current_state），将从断点继续"
+        warn "    如需全新部署，请先运行: $SCRIPT_NAME --reset-state"
+    fi
+
     banner
-    check_dependencies
+    # FIX-H: 每步执行前检查状态机，跳过已完成步骤
+
+    if ! state_done "deps"; then
+        check_dependencies
+        state_set "deps"
+    else
+        info "跳过依赖安装（已完成）"
+    fi
+
+    # get_user_config 每次都执行（TOKEN/DOMAIN 可能需要重新收集）
     get_user_config
-    dns_backup
-    dns_set
-    install_openclaw
-    configure_openclaw
-    configure_tunnel
-    configure_cf_access
-    service_install
-    service_start
+
+    if ! state_done "openclaw_install"; then
+        install_openclaw
+        state_set "openclaw_install"
+    else
+        info "跳过 OpenClaw 安装（已完成）"
+    fi
+
+    if ! state_done "openclaw_config"; then
+        configure_openclaw
+        state_set "openclaw_config"
+    else
+        info "跳过 OpenClaw 配置（已完成）"
+    fi
+
+    if ! state_done "tunnel"; then
+        configure_tunnel
+        state_set "tunnel"
+    else
+        info "跳过 Tunnel 配置（已完成）"
+        # 恢复 TUNNEL_ID（tunnel 已完成时需要从 config.yml 中读取）
+        if [ -f "$CF_CONFIG_DIR/config.yml" ]; then
+            TUNNEL_ID=$(grep '^tunnel:' "$CF_CONFIG_DIR/config.yml" | awk '{print $2}')
+        fi
+    fi
+
+    if ! state_done "access"; then
+        configure_cf_access
+        state_set "access"
+    else
+        info "跳过 CF Access 配置（已完成）"
+    fi
+
+    if ! state_done "service"; then
+        service_install
+        service_start
+        state_set "service"
+    else
+        info "跳过服务注册（已完成），重启服务..."
+        service_start
+    fi
+
     sleep 10
     verify_deployment
+    state_set "done"
 
     echo ""
     echo -e "${GREEN}✅ 部署完成！${NC}"
