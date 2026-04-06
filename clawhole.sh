@@ -1,5 +1,5 @@
 #!/bin/bash
-# ClawHole — OpenClaw + Cloudflare Tunnel 隐私部署脚本 v4.1
+# ClawHole — OpenClaw + Cloudflare Tunnel 隐私部署脚本 v4.2
 # 支持 macOS + Linux (Ubuntu/Debian/CentOS/RHEL/Fedora/Arch)
 #
 # 用法: ./clawhole.sh [选项]
@@ -31,6 +31,12 @@
 #   FIX-9  : 日志 rotation，保留最近 5 份，自动清理旧日志
 #   FIX-10 : --debug 模式启动时输出完整环境快照
 #   FIX-11 : 修正子函数内 set -e + || 混用导致的潜在意外退出
+#
+# v4.2 改动摘要（相对 v4.1）:
+#   FIX-I  : config.yml 新增 metrics: 127.0.0.1:2000，暴露 cloudflared 健康指标
+#   FIX-J  : 新增 tunnel watchdog（launchd StartInterval=300 / systemd timer），
+#             每 5 分钟检查 ha_connections，发现 tunnel 僵死自动重启 cloudflared；
+#             同时检测 gateway 未 load 时自动重载
 #
 # v4.1 改动摘要（相对 v4.0）:
 #   FIX-A  : CF API cf_api_call 区分 2xx(成功) / 4xx(不重试报错) / 5xx(重试)
@@ -671,20 +677,71 @@ EOF
 </dict></plist>
 EOF
 
+    local watchdog_script="$OC_CONFIG_DIR/tunnel-watchdog.sh"
+    local watchdog_plist="$dir/ai.openclaw.tunnel-watchdog.plist"
+
+    cat > "$watchdog_script" <<'WATCHDOG'
+#!/bin/bash
+# ClawHole tunnel watchdog — checks cloudflared ha_connections every 5 min
+CLOUDFLARED_PLIST="$HOME/Library/LaunchAgents/com.cloudflare.cloudflared.plist"
+GATEWAY_PLIST="$HOME/Library/LaunchAgents/ai.openclaw.gateway.plist"
+
+HA_CONN=$(curl -sf --max-time 5 http://127.0.0.1:2000/metrics 2>/dev/null \
+  | grep '^cloudflared_tunnel_ha_connections ' | awk '{print $2}')
+
+if [ -z "$HA_CONN" ] || [ "$HA_CONN" = "0" ]; then
+  echo "[$(date)] cloudflared tunnel down (ha_connections=${HA_CONN:-unreachable}), restarting..."
+  launchctl unload "$CLOUDFLARED_PLIST" 2>/dev/null
+  sleep 2
+  launchctl load "$CLOUDFLARED_PLIST"
+fi
+
+if ! launchctl list 2>/dev/null | grep -q "ai.openclaw.gateway"; then
+  echo "[$(date)] gateway not loaded, loading..."
+  launchctl load "$GATEWAY_PLIST"
+fi
+WATCHDOG
+    chmod +x "$watchdog_script"
+
+    cat > "$watchdog_plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>Label</key><string>ai.openclaw.tunnel-watchdog</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$watchdog_script</string>
+    </array>
+    <key>StartInterval</key><integer>300</integer>
+    <key>RunAtLoad</key><true/>
+    <key>StandardOutPath</key><string>$OC_CONFIG_DIR/logs/tunnel-watchdog.log</string>
+    <key>StandardErrorPath</key><string>$OC_CONFIG_DIR/logs/tunnel-watchdog.log</string>
+</dict></plist>
+EOF
+
+    mkdir -p "$OC_CONFIG_DIR/logs"
+
     # FIX-6: 先 unload 再 load，保证幂等（已注册的先卸掉再重注册）
     _launchctl_unload "$oc_plist"
     _launchctl_load   "$oc_plist"
     _launchctl_unload "$cf_plist"
     _launchctl_load   "$cf_plist"
-    success "✓ launchd 服务已注册"
+    _launchctl_unload "$watchdog_plist"
+    _launchctl_load   "$watchdog_plist"
+    success "✓ launchd 服务已注册（含 tunnel watchdog，每 5 分钟检查一次）"
 }
 
 _uninstall_launchd() {
     local dir="$HOME/Library/LaunchAgents"
     _launchctl_unload "$dir/ai.openclaw.gateway.plist"
     _launchctl_unload "$dir/com.cloudflare.cloudflared.plist"
+    _launchctl_unload "$dir/ai.openclaw.tunnel-watchdog.plist"
     rm -f "$dir/ai.openclaw.gateway.plist"
     rm -f "$dir/com.cloudflare.cloudflared.plist"
+    rm -f "$dir/ai.openclaw.tunnel-watchdog.plist"
+    rm -f "$OC_CONFIG_DIR/tunnel-watchdog.sh"
 }
 
 _install_systemd() {
@@ -743,21 +800,70 @@ ReadWritePaths=$CF_CONFIG_DIR
 WantedBy=multi-user.target
 EOF
 
+    local watchdog_script="$OC_CONFIG_DIR/tunnel-watchdog.sh"
+    cat > "$watchdog_script" <<'WATCHDOG'
+#!/bin/bash
+# ClawHole tunnel watchdog — checks cloudflared ha_connections
+CLOUDFLARED_SERVICE="cloudflared-tunnel"
+
+HA_CONN=$(curl -sf --max-time 5 http://127.0.0.1:2000/metrics 2>/dev/null \
+  | grep '^cloudflared_tunnel_ha_connections ' | awk '{print $2}')
+
+if [ -z "$HA_CONN" ] || [ "$HA_CONN" = "0" ]; then
+  echo "[$(date)] cloudflared tunnel down (ha_connections=${HA_CONN:-unreachable}), restarting..."
+  systemctl restart "$CLOUDFLARED_SERVICE"
+fi
+
+if ! systemctl is-active --quiet openclaw-gateway; then
+  echo "[$(date)] gateway not running, starting..."
+  systemctl start openclaw-gateway
+fi
+WATCHDOG
+    chmod +x "$watchdog_script"
+
+    sudo tee /etc/systemd/system/clawhole-watchdog.service > /dev/null <<EOF
+[Unit]
+Description=ClawHole Tunnel Watchdog
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$watchdog_script
+EOF
+
+    sudo tee /etc/systemd/system/clawhole-watchdog.timer > /dev/null <<EOF
+[Unit]
+Description=ClawHole Tunnel Watchdog Timer
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=300
+
+[Install]
+WantedBy=timers.target
+EOF
+
     sudo systemctl daemon-reload
 
     # FIX-6: enable 幂等（已 enable 的不会报错）
     sudo systemctl enable openclaw-gateway  >>"$LOG_FILE" 2>&1 || true
     sudo systemctl enable cloudflared-tunnel >>"$LOG_FILE" 2>&1 || true
-    success "✓ systemd 服务已注册"
+    sudo systemctl enable --now clawhole-watchdog.timer >>"$LOG_FILE" 2>&1 || true
+    success "✓ systemd 服务已注册（含 tunnel watchdog，每 5 分钟检查一次）"
 }
 
 _uninstall_systemd() {
     sudo systemctl stop    openclaw-gateway    2>/dev/null || true
     sudo systemctl stop    cloudflared-tunnel  2>/dev/null || true
+    sudo systemctl stop    clawhole-watchdog.timer 2>/dev/null || true
     sudo systemctl disable openclaw-gateway    2>/dev/null || true
     sudo systemctl disable cloudflared-tunnel  2>/dev/null || true
+    sudo systemctl disable clawhole-watchdog.timer 2>/dev/null || true
     sudo rm -f /etc/systemd/system/openclaw-gateway.service
     sudo rm -f /etc/systemd/system/cloudflared-tunnel.service
+    sudo rm -f /etc/systemd/system/clawhole-watchdog.service
+    sudo rm -f /etc/systemd/system/clawhole-watchdog.timer
+    rm -f "$OC_CONFIG_DIR/tunnel-watchdog.sh"
     sudo systemctl daemon-reload 2>/dev/null || true
 }
 
@@ -976,6 +1082,7 @@ except Exception:
 tunnel: $tunnel_id
 credentials-file: $CF_CONFIG_DIR/$tunnel_id.json
 protocol: http2
+metrics: 127.0.0.1:2000
 
 ingress:
   - hostname: $DOMAIN
@@ -1111,6 +1218,7 @@ except Exception:
 tunnel: $TUNNEL_ID
 credentials-file: $CF_CONFIG_DIR/$TUNNEL_ID.json
 protocol: http2
+metrics: 127.0.0.1:2000
 
 ingress:
   - hostname: $DOMAIN
