@@ -32,6 +32,13 @@
 #   FIX-10 : --debug 模式启动时输出完整环境快照
 #   FIX-11 : 修正子函数内 set -e + || 混用导致的潜在意外退出
 #
+# v4.3 改动摘要（相对 v4.2）:
+#   FIX-K  : watchdog 健康阈值改为 MIN_HA_CONN（默认 2），检测静默掉连，
+#             原逻辑只在 ha_connections=0 时重启，无法发现 4→2 的部分失联；
+#             重启用 launchctl kickstart -k / systemctl restart，更干净
+#   FIX-L  : 新增每日 04:00 保底重启 cloudflared（launchd StartCalendarInterval /
+#             systemd OnCalendar），兜底长跑静默故障
+#
 # v4.2 改动摘要（相对 v4.1）:
 #   FIX-I  : config.yml 新增 metrics: 127.0.0.1:2000，暴露 cloudflared 健康指标
 #   FIX-J  : 新增 tunnel watchdog（launchd StartInterval=300 / systemd timer），
@@ -54,7 +61,7 @@ set -o pipefail
 # ============================================================
 # 全局常量
 # ============================================================
-readonly SCRIPT_VERSION="4.1.0"
+readonly SCRIPT_VERSION="4.3.0"
 readonly SCRIPT_NAME="clawhole.sh"
 readonly DEFAULT_PORT=10371
 # FIX-F: TUNNEL_NAME 在 main() 中根据 DOMAIN 动态设置，支持多实例
@@ -683,17 +690,17 @@ EOF
     cat > "$watchdog_script" <<'WATCHDOG'
 #!/bin/bash
 # ClawHole tunnel watchdog — checks cloudflared ha_connections every 5 min
-CLOUDFLARED_PLIST="$HOME/Library/LaunchAgents/com.cloudflare.cloudflared.plist"
+# MIN_HA_CONN: 最小可接受 HA 连接数；本机开 WARP 时 cloudflared 最多只能建 2 路，
+# 无 WARP 时可达 4；默认 2 兼容两种场景，必要时可在 plist 里 override。
+MIN_HA_CONN=${MIN_HA_CONN:-2}
 GATEWAY_PLIST="$HOME/Library/LaunchAgents/ai.openclaw.gateway.plist"
 
 HA_CONN=$(curl -sf --max-time 5 http://127.0.0.1:2000/metrics 2>/dev/null \
   | grep '^cloudflared_tunnel_ha_connections ' | awk '{print $2}')
 
-if [ -z "$HA_CONN" ] || [ "$HA_CONN" = "0" ]; then
-  echo "[$(date)] cloudflared tunnel down (ha_connections=${HA_CONN:-unreachable}), restarting..."
-  launchctl unload "$CLOUDFLARED_PLIST" 2>/dev/null
-  sleep 2
-  launchctl load "$CLOUDFLARED_PLIST"
+if [ -z "$HA_CONN" ] || ! [[ "$HA_CONN" =~ ^[0-9]+$ ]] || [ "$HA_CONN" -lt "$MIN_HA_CONN" ]; then
+  echo "[$(date)] cloudflared unhealthy (ha_connections=${HA_CONN:-unreachable}, min=$MIN_HA_CONN), kickstart..."
+  launchctl kickstart -k "gui/$(id -u)/com.cloudflare.cloudflared"
 fi
 
 if ! launchctl list 2>/dev/null | grep -q "ai.openclaw.gateway"; then
@@ -721,6 +728,31 @@ WATCHDOG
 </dict></plist>
 EOF
 
+    # 每日保底重启 cloudflared（04:00），防止 HA 连接静默掉线
+    local daily_plist="$dir/ai.openclaw.tunnel-daily-restart.plist"
+    cat > "$daily_plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>Label</key><string>ai.openclaw.tunnel-daily-restart</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/launchctl</string>
+        <string>kickstart</string>
+        <string>-k</string>
+        <string>gui/$(id -u)/com.cloudflare.cloudflared</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>4</integer>
+        <key>Minute</key><integer>0</integer>
+    </dict>
+    <key>StandardOutPath</key><string>$OC_CONFIG_DIR/logs/tunnel-daily-restart.log</string>
+    <key>StandardErrorPath</key><string>$OC_CONFIG_DIR/logs/tunnel-daily-restart.log</string>
+</dict></plist>
+EOF
+
     mkdir -p "$OC_CONFIG_DIR/logs"
 
     # FIX-6: 先 unload 再 load，保证幂等（已注册的先卸掉再重注册）
@@ -730,7 +762,9 @@ EOF
     _launchctl_load   "$cf_plist"
     _launchctl_unload "$watchdog_plist"
     _launchctl_load   "$watchdog_plist"
-    success "✓ launchd 服务已注册（含 tunnel watchdog，每 5 分钟检查一次）"
+    _launchctl_unload "$daily_plist"
+    _launchctl_load   "$daily_plist"
+    success "✓ launchd 服务已注册（watchdog 每 5 分钟健康检查 + 每日 04:00 保底重启）"
 }
 
 _uninstall_launchd() {
@@ -738,9 +772,11 @@ _uninstall_launchd() {
     _launchctl_unload "$dir/ai.openclaw.gateway.plist"
     _launchctl_unload "$dir/com.cloudflare.cloudflared.plist"
     _launchctl_unload "$dir/ai.openclaw.tunnel-watchdog.plist"
+    _launchctl_unload "$dir/ai.openclaw.tunnel-daily-restart.plist"
     rm -f "$dir/ai.openclaw.gateway.plist"
     rm -f "$dir/com.cloudflare.cloudflared.plist"
     rm -f "$dir/ai.openclaw.tunnel-watchdog.plist"
+    rm -f "$dir/ai.openclaw.tunnel-daily-restart.plist"
     rm -f "$OC_CONFIG_DIR/tunnel-watchdog.sh"
 }
 
@@ -804,13 +840,15 @@ EOF
     cat > "$watchdog_script" <<'WATCHDOG'
 #!/bin/bash
 # ClawHole tunnel watchdog — checks cloudflared ha_connections
+# MIN_HA_CONN: 最小可接受 HA 连接数；默认 2（WARP 场景上限）
+MIN_HA_CONN=${MIN_HA_CONN:-2}
 CLOUDFLARED_SERVICE="cloudflared-tunnel"
 
 HA_CONN=$(curl -sf --max-time 5 http://127.0.0.1:2000/metrics 2>/dev/null \
   | grep '^cloudflared_tunnel_ha_connections ' | awk '{print $2}')
 
-if [ -z "$HA_CONN" ] || [ "$HA_CONN" = "0" ]; then
-  echo "[$(date)] cloudflared tunnel down (ha_connections=${HA_CONN:-unreachable}), restarting..."
+if [ -z "$HA_CONN" ] || ! [[ "$HA_CONN" =~ ^[0-9]+$ ]] || [ "$HA_CONN" -lt "$MIN_HA_CONN" ]; then
+  echo "[$(date)] cloudflared unhealthy (ha_connections=${HA_CONN:-unreachable}, min=$MIN_HA_CONN), restarting..."
   systemctl restart "$CLOUDFLARED_SERVICE"
 fi
 
@@ -843,26 +881,53 @@ OnUnitActiveSec=300
 WantedBy=timers.target
 EOF
 
+    # 每日保底重启 cloudflared（04:00），防止 HA 连接静默掉线
+    sudo tee /etc/systemd/system/clawhole-daily-restart.service > /dev/null <<EOF
+[Unit]
+Description=ClawHole Daily cloudflared Restart
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl restart cloudflared-tunnel
+EOF
+
+    sudo tee /etc/systemd/system/clawhole-daily-restart.timer > /dev/null <<EOF
+[Unit]
+Description=ClawHole Daily cloudflared Restart Timer
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
     sudo systemctl daemon-reload
 
     # FIX-6: enable 幂等（已 enable 的不会报错）
     sudo systemctl enable openclaw-gateway  >>"$LOG_FILE" 2>&1 || true
     sudo systemctl enable cloudflared-tunnel >>"$LOG_FILE" 2>&1 || true
     sudo systemctl enable --now clawhole-watchdog.timer >>"$LOG_FILE" 2>&1 || true
-    success "✓ systemd 服务已注册（含 tunnel watchdog，每 5 分钟检查一次）"
+    sudo systemctl enable --now clawhole-daily-restart.timer >>"$LOG_FILE" 2>&1 || true
+    success "✓ systemd 服务已注册（watchdog 每 5 分钟健康检查 + 每日 04:00 保底重启）"
 }
 
 _uninstall_systemd() {
     sudo systemctl stop    openclaw-gateway    2>/dev/null || true
     sudo systemctl stop    cloudflared-tunnel  2>/dev/null || true
     sudo systemctl stop    clawhole-watchdog.timer 2>/dev/null || true
+    sudo systemctl stop    clawhole-daily-restart.timer 2>/dev/null || true
     sudo systemctl disable openclaw-gateway    2>/dev/null || true
     sudo systemctl disable cloudflared-tunnel  2>/dev/null || true
     sudo systemctl disable clawhole-watchdog.timer 2>/dev/null || true
+    sudo systemctl disable clawhole-daily-restart.timer 2>/dev/null || true
     sudo rm -f /etc/systemd/system/openclaw-gateway.service
     sudo rm -f /etc/systemd/system/cloudflared-tunnel.service
     sudo rm -f /etc/systemd/system/clawhole-watchdog.service
     sudo rm -f /etc/systemd/system/clawhole-watchdog.timer
+    sudo rm -f /etc/systemd/system/clawhole-daily-restart.service
+    sudo rm -f /etc/systemd/system/clawhole-daily-restart.timer
     rm -f "$OC_CONFIG_DIR/tunnel-watchdog.sh"
     sudo systemctl daemon-reload 2>/dev/null || true
 }
