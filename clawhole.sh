@@ -32,6 +32,18 @@
 #   FIX-10 : --debug 模式启动时输出完整环境快照
 #   FIX-11 : 修正子函数内 set -e + || 混用导致的潜在意外退出
 #
+# v4.4 改动摘要（相对 v4.3）:
+#   FIX-M  : watchdog v3 — 三层健康检测（L1 metrics可达 / L2 HA连接数 / L3 流量是否增长）
+#             连续失败计数（FAIL_THRESHOLD=3）避免瞬时抖动误重启；
+#             状态文件持久化（~/.openclaw/.watchdog/），重启不丢失计数
+#             日志 rotation（>1MB 自动归档，保留 4 份）
+#             并发锁（macOS: mkdir 原子操作 / Linux: flock）
+#             状态文件损坏防护（非数字内容自动回退）
+#             curl origin check 双写 bug 修复（000000 → 000）
+#   FIX-N  : config.yml protocol: http2 → auto，启用 QUIC 自动降级
+#   FIX-O  : config.yml originRequest 新增 retries: 8 + gracePeriod: 10s
+#   FIX-P  : 每日 04:00 重启改为条件性检查，只在 tunnel 不健康时重启
+#
 # v4.3 改动摘要（相对 v4.2）:
 #   FIX-K  : watchdog 健康阈值改为 MIN_HA_CONN（默认 2），检测静默掉连，
 #             原逻辑只在 ha_connections=0 时重启，无法发现 4→2 的部分失联；
@@ -61,7 +73,7 @@ set -o pipefail
 # ============================================================
 # 全局常量
 # ============================================================
-readonly SCRIPT_VERSION="4.3.0"
+readonly SCRIPT_VERSION="4.4.0"
 readonly SCRIPT_NAME="clawhole.sh"
 readonly DEFAULT_PORT=10371
 # FIX-F: TUNNEL_NAME 在 main() 中根据 DOMAIN 动态设置，支持多实例
@@ -689,24 +701,144 @@ EOF
 
     cat > "$watchdog_script" <<'WATCHDOG'
 #!/bin/bash
-# ClawHole tunnel watchdog — checks cloudflared ha_connections every 5 min
-# MIN_HA_CONN: 最小可接受 HA 连接数；本机开 WARP 时 cloudflared 最多只能建 2 路，
-# 无 WARP 时可达 4；默认 2 兼容两种场景，必要时可在 plist 里 override。
+# ClawHole tunnel watchdog v3 — multi-layer health detection
+# L1 (metrics reachable) → L2 (HA connections) → L3 (traffic flowing)
+# Uses consecutive failure counting to avoid false positives.
+# Adversarial-hardened: macOS flock workaround, pipefail-safe, corruption guards.
 MIN_HA_CONN=${MIN_HA_CONN:-2}
+METRICS_URL="http://127.0.0.1:2000/metrics"
+METRICS_TIMEOUT=10
+ORIGIN_URL=${ORIGIN_URL:-"http://127.0.0.1:18789/health"}
+FAIL_THRESHOLD=${FAIL_THRESHOLD:-3}
+STALE_MAX_SECONDS=${STALE_MAX_SECONDS:-600}
+CLOUDFLARED_LABEL="gui/$(id -u)/com.cloudflare.cloudflared"
 GATEWAY_PLIST="$HOME/Library/LaunchAgents/ai.openclaw.gateway.plist"
 
-HA_CONN=$(curl -sf --max-time 5 http://127.0.0.1:2000/metrics 2>/dev/null \
-  | grep '^cloudflared_tunnel_ha_connections ' | awk '{print $2}')
+STATE_DIR="$HOME/.openclaw/.watchdog"
+mkdir -p "$STATE_DIR"
+FAIL_FILE="$STATE_DIR/consecutive_failures"
+LAST_REQ_FILE="$STATE_DIR/last_total_requests"
+LAST_REQ_TIME_FILE="$STATE_DIR/last_req_change_time"
+LOCK_FILE="$STATE_DIR/watchdog.lock"
 
+LOG_FILE="$HOME/.openclaw/logs/tunnel-watchdog.log"
+mkdir -p "$(dirname "$LOG_FILE")"
+if [ -f "$LOG_FILE" ]; then
+  SIZE=$(stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
+  if [ "$SIZE" -gt 1048576 ]; then
+    mv "$LOG_FILE" "${LOG_FILE}.$(date +%Y%m%d%H%M%S).bak"
+    ls -t "${LOG_FILE}."*.bak 2>/dev/null | tail -n +4 | xargs rm -f 2>/dev/null || true
+  fi
+fi
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; }
+
+# Concurrency lock (macOS: mkdir is atomic)
+if ! mkdir "$LOCK_FILE" 2>/dev/null; then
+  OLD_PID=$(cat "$LOCK_FILE/pid" 2>/dev/null || echo "")
+  if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+    log "WARN: previous watchdog run (PID $OLD_PID) still active, skipping"
+    exit 0
+  fi
+  rm -rf "$LOCK_FILE"
+  mkdir "$LOCK_FILE" 2>/dev/null || { log "WARN: could not acquire lock, skipping"; exit 0; }
+fi
+echo $$ > "$LOCK_FILE/pid"
+trap 'rm -rf "$LOCK_FILE"' EXIT
+
+get_metric() {
+  local line
+  line=$(echo "$1" | grep "^$2 " 2>/dev/null || true)
+  if [ -n "$line" ]; then
+    echo "$line" | awk '{print $2}' | head -1
+  fi
+}
+
+fail_count=$(cat "$FAIL_FILE" 2>/dev/null || echo 0)
+
+do_restart() {
+  local reason="$1"
+  log "RESTART: $reason (consecutive_failures=$((fail_count + 1))/$FAIL_THRESHOLD)"
+  launchctl kickstart -k "$CLOUDFLARED_LABEL" 2>/dev/null || true
+  echo 0 > "$FAIL_FILE"
+  rm -f "$LAST_REQ_FILE" "$LAST_REQ_TIME_FILE"
+}
+
+record_failure() {
+  fail_count=$((fail_count + 1))
+  echo "$fail_count" > "$FAIL_FILE"
+}
+
+record_success() {
+  echo 0 > "$FAIL_FILE"
+}
+
+# L1: Metrics endpoint reachable?
+METRICS=$(curl -sf --max-time "$METRICS_TIMEOUT" "$METRICS_URL" 2>/dev/null || echo "")
+if [ -z "$METRICS" ]; then
+  record_failure
+  if [ "$fail_count" -ge "$FAIL_THRESHOLD" ]; then
+    do_restart "L1: metrics endpoint unreachable for $fail_count consecutive checks"
+  else
+    log "L1-FAIL: metrics unreachable ($fail_count/$FAIL_THRESHOLD)"
+  fi
+  exit 0
+fi
+
+# L2: HA connections sufficient?
+HA_CONN=$(get_metric "$METRICS" "cloudflared_tunnel_ha_connections")
 if [ -z "$HA_CONN" ] || ! [[ "$HA_CONN" =~ ^[0-9]+$ ]] || [ "$HA_CONN" -lt "$MIN_HA_CONN" ]; then
-  echo "[$(date)] cloudflared unhealthy (ha_connections=${HA_CONN:-unreachable}, min=$MIN_HA_CONN), kickstart..."
-  launchctl kickstart -k "gui/$(id -u)/com.cloudflare.cloudflared"
+  record_failure
+  if [ "$fail_count" -ge "$FAIL_THRESHOLD" ]; then
+    do_restart "L2: ha_connections=${HA_CONN:-unset} < $MIN_HA_CONN for $fail_count consecutive checks"
+  else
+    log "L2-FAIL: ha_connections=${HA_CONN:-unset} < $MIN_HA_CONN ($fail_count/$FAIL_THRESHOLD)"
+  fi
+  exit 0
 fi
 
-if ! launchctl list 2>/dev/null | grep -q "ai.openclaw.gateway"; then
-  echo "[$(date)] gateway not loaded, loading..."
-  launchctl load "$GATEWAY_PLIST"
+# L3: Traffic flowing? (check total_requests growth)
+TOTAL_REQ=$(get_metric "$METRICS" "cloudflared_tunnel_total_requests")
+if [ -n "$TOTAL_REQ" ] && [[ "$TOTAL_REQ" =~ ^[0-9]+$ ]]; then
+  LAST_REQ=$(cat "$LAST_REQ_FILE" 2>/dev/null || echo "")
+  NOW=$(date +%s)
+  if [ -n "$LAST_REQ" ] && [ "$TOTAL_REQ" -eq "$LAST_REQ" ] 2>/dev/null; then
+    LAST_CHANGE=$(cat "$LAST_REQ_TIME_FILE" 2>/dev/null || echo "$NOW")
+    if ! [[ "$LAST_CHANGE" =~ ^[0-9]+$ ]]; then LAST_CHANGE="$NOW"; fi
+    ELAPSED=$((NOW - LAST_CHANGE))
+    if [ "$ELAPSED" -gt "$STALE_MAX_SECONDS" ]; then
+      record_failure
+      if [ "$fail_count" -ge "$FAIL_THRESHOLD" ]; then
+        do_restart "L3: no traffic growth for ${ELAPSED}s (total_req=$TOTAL_REQ) for $fail_count consecutive checks"
+      else
+        log "L3-FAIL: no traffic growth for ${ELAPSED}s ($fail_count/$FAIL_THRESHOLD)"
+      fi
+      exit 0
+    fi
+  else
+    echo "$NOW" > "$LAST_REQ_TIME_FILE"
+  fi
+  echo "$TOTAL_REQ" > "$LAST_REQ_FILE"
 fi
+
+record_success
+
+# Periodic origin check (1 in 3 chance)
+if [ $((RANDOM % 3)) -eq 0 ]; then
+  ORIGIN_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$ORIGIN_URL" 2>/dev/null) || ORIGIN_CODE="000"
+  if [ "$ORIGIN_CODE" = "000" ]; then
+    log "WARN: origin unreachable at $ORIGIN_URL"
+    if ! launchctl list 2>/dev/null | grep -q "ai.openclaw.gateway"; then
+      log "INFO: gateway not loaded, loading..."
+      launchctl load "$GATEWAY_PLIST" 2>/dev/null || true
+    fi
+  fi
+fi
+
+ERRS=$(get_metric "$METRICS" "cloudflared_tunnel_request_errors")
+EDGES=$(echo "$METRICS" | grep 'cloudflared_tunnel_server_locations' 2>/dev/null \
+  | awk -F'"' '{print $4}' | sort -u | tr '\n' ',' | sed 's/,$//' || true)
+log "OK: ha=$HA_CONN total_req=${TOTAL_REQ:-unknown} errors=${ERRS:-unknown} edges=${EDGES:-unknown}"
 WATCHDOG
     chmod +x "$watchdog_script"
 
@@ -728,8 +860,22 @@ WATCHDOG
 </dict></plist>
 EOF
 
-    # 每日保底重启 cloudflared（04:00），防止 HA 连接静默掉线
+    # 每日条件性检查（04:00）：只在检测到问题时重启，避免不必要的中断
+    local daily_script="$OC_CONFIG_DIR/tunnel-daily-check.sh"
     local daily_plist="$dir/ai.openclaw.tunnel-daily-restart.plist"
+    cat > "$daily_script" <<'DAILY'
+#!/bin/bash
+# Conditional daily restart — only restart if tunnel is unhealthy
+HA_CONN=$(curl -sf --max-time 10 http://127.0.0.1:2000/metrics 2>/dev/null \
+  | grep '^cloudflared_tunnel_ha_connections ' 2>/dev/null | awk '{print $2}')
+if [ -z "$HA_CONN" ] || [ "$HA_CONN" -lt 2 ] 2>/dev/null; then
+  echo "[$(date)] daily check: unhealthy (ha=${HA_CONN:-unreachable}), restarting"
+  launchctl kickstart -k "gui/$(id -u)/com.cloudflare.cloudflared"
+else
+  echo "[$(date)] daily check: healthy (ha=$HA_CONN), no restart needed"
+fi
+DAILY
+    chmod +x "$daily_script"
     cat > "$daily_plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -738,10 +884,8 @@ EOF
     <key>Label</key><string>ai.openclaw.tunnel-daily-restart</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/launchctl</string>
-        <string>kickstart</string>
-        <string>-k</string>
-        <string>gui/$(id -u)/com.cloudflare.cloudflared</string>
+        <string>/bin/bash</string>
+        <string>$daily_script</string>
     </array>
     <key>StartCalendarInterval</key>
     <dict>
@@ -839,23 +983,135 @@ EOF
     local watchdog_script="$OC_CONFIG_DIR/tunnel-watchdog.sh"
     cat > "$watchdog_script" <<'WATCHDOG'
 #!/bin/bash
-# ClawHole tunnel watchdog — checks cloudflared ha_connections
-# MIN_HA_CONN: 最小可接受 HA 连接数；默认 2（WARP 场景上限）
+# ClawHole tunnel watchdog v3 — multi-layer health detection (Linux)
+# L1 (metrics reachable) → L2 (HA connections) → L3 (traffic flowing)
 MIN_HA_CONN=${MIN_HA_CONN:-2}
+METRICS_URL="http://127.0.0.1:2000/metrics"
+METRICS_TIMEOUT=10
+ORIGIN_URL=${ORIGIN_URL:-"http://127.0.0.1:18789/health"}
+FAIL_THRESHOLD=${FAIL_THRESHOLD:-3}
+STALE_MAX_SECONDS=${STALE_MAX_SECONDS:-600}
 CLOUDFLARED_SERVICE="cloudflared-tunnel"
 
-HA_CONN=$(curl -sf --max-time 5 http://127.0.0.1:2000/metrics 2>/dev/null \
-  | grep '^cloudflared_tunnel_ha_connections ' | awk '{print $2}')
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/clawhole/.watchdog"
+mkdir -p "$STATE_DIR"
+FAIL_FILE="$STATE_DIR/consecutive_failures"
+LAST_REQ_FILE="$STATE_DIR/last_total_requests"
+LAST_REQ_TIME_FILE="$STATE_DIR/last_req_change_time"
+LOCK_FILE="$STATE_DIR/watchdog.lock"
 
+LOG_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/clawhole/logs/tunnel-watchdog.log"
+mkdir -p "$(dirname "$LOG_FILE")"
+if [ -f "$LOG_FILE" ]; then
+  SIZE=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
+  if [ "$SIZE" -gt 1048576 ]; then
+    mv "$LOG_FILE" "${LOG_FILE}.$(date +%Y%m%d%H%M%S).bak"
+    ls -t "${LOG_FILE}."*.bak 2>/dev/null | tail -n +4 | xargs rm -f 2>/dev/null || true
+  fi
+fi
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; }
+
+# Concurrency lock (flock on Linux)
+exec 200>"$LOCK_FILE"
+if ! flock -n 200; then
+  log "WARN: previous watchdog run still active, skipping"
+  exit 0
+fi
+
+get_metric() {
+  local line
+  line=$(echo "$1" | grep "^$2 " 2>/dev/null || true)
+  if [ -n "$line" ]; then
+    echo "$line" | awk '{print $2}' | head -1
+  fi
+}
+
+fail_count=$(cat "$FAIL_FILE" 2>/dev/null || echo 0)
+
+do_restart() {
+  local reason="$1"
+  log "RESTART: $reason (consecutive_failures=$((fail_count + 1))/$FAIL_THRESHOLD)"
+  systemctl restart "$CLOUDFLARED_SERVICE" 2>/dev/null || true
+  echo 0 > "$FAIL_FILE"
+  rm -f "$LAST_REQ_FILE" "$LAST_REQ_TIME_FILE"
+}
+
+record_failure() {
+  fail_count=$((fail_count + 1))
+  echo "$fail_count" > "$FAIL_FILE"
+}
+
+record_success() {
+  echo 0 > "$FAIL_FILE"
+}
+
+# L1: Metrics endpoint reachable?
+METRICS=$(curl -sf --max-time "$METRICS_TIMEOUT" "$METRICS_URL" 2>/dev/null || echo "")
+if [ -z "$METRICS" ]; then
+  record_failure
+  if [ "$fail_count" -ge "$FAIL_THRESHOLD" ]; then
+    do_restart "L1: metrics endpoint unreachable for $fail_count consecutive checks"
+  else
+    log "L1-FAIL: metrics unreachable ($fail_count/$FAIL_THRESHOLD)"
+  fi
+  exit 0
+fi
+
+# L2: HA connections sufficient?
+HA_CONN=$(get_metric "$METRICS" "cloudflared_tunnel_ha_connections")
 if [ -z "$HA_CONN" ] || ! [[ "$HA_CONN" =~ ^[0-9]+$ ]] || [ "$HA_CONN" -lt "$MIN_HA_CONN" ]; then
-  echo "[$(date)] cloudflared unhealthy (ha_connections=${HA_CONN:-unreachable}, min=$MIN_HA_CONN), restarting..."
-  systemctl restart "$CLOUDFLARED_SERVICE"
+  record_failure
+  if [ "$fail_count" -ge "$FAIL_THRESHOLD" ]; then
+    do_restart "L2: ha_connections=${HA_CONN:-unset} < $MIN_HA_CONN for $fail_count consecutive checks"
+  else
+    log "L2-FAIL: ha_connections=${HA_CONN:-unset} < $MIN_HA_CONN ($fail_count/$FAIL_THRESHOLD)"
+  fi
+  exit 0
 fi
 
-if ! systemctl is-active --quiet openclaw-gateway; then
-  echo "[$(date)] gateway not running, starting..."
-  systemctl start openclaw-gateway
+# L3: Traffic flowing?
+TOTAL_REQ=$(get_metric "$METRICS" "cloudflared_tunnel_total_requests")
+if [ -n "$TOTAL_REQ" ] && [[ "$TOTAL_REQ" =~ ^[0-9]+$ ]]; then
+  LAST_REQ=$(cat "$LAST_REQ_FILE" 2>/dev/null || echo "")
+  NOW=$(date +%s)
+  if [ -n "$LAST_REQ" ] && [ "$TOTAL_REQ" -eq "$LAST_REQ" ] 2>/dev/null; then
+    LAST_CHANGE=$(cat "$LAST_REQ_TIME_FILE" 2>/dev/null || echo "$NOW")
+    if ! [[ "$LAST_CHANGE" =~ ^[0-9]+$ ]]; then LAST_CHANGE="$NOW"; fi
+    ELAPSED=$((NOW - LAST_CHANGE))
+    if [ "$ELAPSED" -gt "$STALE_MAX_SECONDS" ]; then
+      record_failure
+      if [ "$fail_count" -ge "$FAIL_THRESHOLD" ]; then
+        do_restart "L3: no traffic growth for ${ELAPSED}s (total_req=$TOTAL_REQ) for $fail_count consecutive checks"
+      else
+        log "L3-FAIL: no traffic growth for ${ELAPSED}s ($fail_count/$FAIL_THRESHOLD)"
+      fi
+      exit 0
+    fi
+  else
+    echo "$NOW" > "$LAST_REQ_TIME_FILE"
+  fi
+  echo "$TOTAL_REQ" > "$LAST_REQ_FILE"
 fi
+
+record_success
+
+# Periodic origin check
+if [ $((RANDOM % 3)) -eq 0 ]; then
+  ORIGIN_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$ORIGIN_URL" 2>/dev/null) || ORIGIN_CODE="000"
+  if [ "$ORIGIN_CODE" = "000" ]; then
+    log "WARN: origin unreachable at $ORIGIN_URL"
+    if ! systemctl is-active --quiet openclaw-gateway; then
+      log "INFO: gateway not running, starting..."
+      systemctl start openclaw-gateway 2>/dev/null || true
+    fi
+  fi
+fi
+
+ERRS=$(get_metric "$METRICS" "cloudflared_tunnel_request_errors")
+EDGES=$(echo "$METRICS" | grep 'cloudflared_tunnel_server_locations' 2>/dev/null \
+  | awk -F'"' '{print $4}' | sort -u | tr '\n' ',' | sed 's/,$//' || true)
+log "OK: ha=$HA_CONN total_req=${TOTAL_REQ:-unknown} errors=${ERRS:-unknown} edges=${EDGES:-unknown}"
 WATCHDOG
     chmod +x "$watchdog_script"
 
@@ -881,14 +1137,14 @@ OnUnitActiveSec=300
 WantedBy=timers.target
 EOF
 
-    # 每日保底重启 cloudflared（04:00），防止 HA 连接静默掉线
+    # 每日条件性检查（04:00）：只在检测到问题时重启
     sudo tee /etc/systemd/system/clawhole-daily-restart.service > /dev/null <<EOF
 [Unit]
-Description=ClawHole Daily cloudflared Restart
+Description=ClawHole Daily cloudflared Check
 
 [Service]
 Type=oneshot
-ExecStart=/bin/systemctl restart cloudflared-tunnel
+ExecStart=/bin/bash -c 'HA_CONN=$(curl -sf --max-time 10 http://127.0.0.1:2000/metrics 2>/dev/null | grep "^cloudflared_tunnel_ha_connections " | awk "{print \$2}"); if [ -z "$HA_CONN" ] || [ "$HA_CONN" -lt 2 ] 2>/dev/null; then echo "daily check: unhealthy, restarting"; systemctl restart cloudflared-tunnel; else echo "daily check: healthy (ha=$HA_CONN)"; fi'
 EOF
 
     sudo tee /etc/systemd/system/clawhole-daily-restart.timer > /dev/null <<EOF
@@ -1146,7 +1402,7 @@ except Exception:
     cat > "$CF_CONFIG_DIR/config.yml" <<EOF
 tunnel: $tunnel_id
 credentials-file: $CF_CONFIG_DIR/$tunnel_id.json
-protocol: http2
+protocol: auto
 metrics: 127.0.0.1:2000
 
 ingress:
@@ -1158,7 +1414,8 @@ ingress:
       connectTimeout: 30s
       keepAliveConnections: 100
       keepAliveTimeout: 90s
-  - service: http_status:404
+      retries: 8
+      gracePeriod: 10s  - service: http_status:404
 
 logfile: $CF_CONFIG_DIR/tunnel.log
 loglevel: info
@@ -1282,7 +1539,7 @@ except Exception:
     cat > "$CF_CONFIG_DIR/config.yml" <<EOF
 tunnel: $TUNNEL_ID
 credentials-file: $CF_CONFIG_DIR/$TUNNEL_ID.json
-protocol: http2
+protocol: auto
 metrics: 127.0.0.1:2000
 
 ingress:
@@ -1294,7 +1551,8 @@ ingress:
       connectTimeout: 30s
       keepAliveConnections: 100
       keepAliveTimeout: 90s
-      access:
+      retries: 8
+      gracePeriod: 10s      access:
         required: true
         teamName: "${CF_TEAM_NAME}.cloudflareaccess.com"
         audTag:
