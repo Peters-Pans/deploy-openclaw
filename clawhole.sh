@@ -705,20 +705,18 @@ EOF
 MIN_HA_CONN=${MIN_HA_CONN:-2}
 METRICS_URL="http://127.0.0.1:2000/metrics"
 METRICS_TIMEOUT=10
-ORIGIN_URL=${ORIGIN_URL:-"http://127.0.0.1:${OC_GATEWAY_PORT:-10371}/health"}
 FAIL_THRESHOLD=${FAIL_THRESHOLD:-3}
 STALE_MAX_SECONDS=${STALE_MAX_SECONDS:-600}
 CLOUDFLARED_LABEL="gui/$(id -u)/com.cloudflare.cloudflared"
-GATEWAY_PLIST="$HOME/Library/LaunchAgents/ai.openclaw.gateway.plist"
 
-STATE_DIR="$HOME/.openclaw/.watchdog"
+STATE_DIR="${CLOUDFLARED_STATE_DIR:-$HOME/.cloudflared/.watchdog}"
 mkdir -p "$STATE_DIR"
 FAIL_FILE="$STATE_DIR/consecutive_failures"
 LAST_REQ_FILE="$STATE_DIR/last_total_requests"
 LAST_REQ_TIME_FILE="$STATE_DIR/last_req_change_time"
 LOCK_FILE="$STATE_DIR/watchdog.lock"
 
-LOG_FILE="$HOME/.openclaw/logs/tunnel-watchdog.log"
+LOG_FILE="${CLOUDFLARED_WATCHDOG_LOG:-$HOME/.cloudflared/logs/watchdog.log}"
 mkdir -p "$(dirname "$LOG_FILE")"
 if [ -f "$LOG_FILE" ]; then
   SIZE=$(stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
@@ -819,18 +817,6 @@ if [ -n "$TOTAL_REQ" ] && [[ "$TOTAL_REQ" =~ ^[0-9]+$ ]]; then
 fi
 
 record_success
-
-# Periodic origin check (1 in 3 chance)
-if [ $((RANDOM % 3)) -eq 0 ]; then
-  ORIGIN_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$ORIGIN_URL" 2>/dev/null) || ORIGIN_CODE="000"
-  if [ "$ORIGIN_CODE" = "000" ]; then
-    log "WARN: origin unreachable at $ORIGIN_URL"
-    if ! launchctl list 2>/dev/null | grep -q "ai.openclaw.gateway"; then
-      log "INFO: gateway not loaded, loading..."
-      launchctl load "$GATEWAY_PLIST" 2>/dev/null || true
-    fi
-  fi
-fi
 
 ERRS=$(get_metric "$METRICS" "cloudflared_tunnel_request_errors")
 EDGES=$(echo "$METRICS" | grep 'cloudflared_tunnel_server_locations' 2>/dev/null \
@@ -985,19 +971,18 @@ EOF
 MIN_HA_CONN=${MIN_HA_CONN:-2}
 METRICS_URL="http://127.0.0.1:2000/metrics"
 METRICS_TIMEOUT=10
-ORIGIN_URL=${ORIGIN_URL:-"http://127.0.0.1:${OC_GATEWAY_PORT:-10371}/health"}
 FAIL_THRESHOLD=${FAIL_THRESHOLD:-3}
 STALE_MAX_SECONDS=${STALE_MAX_SECONDS:-600}
 CLOUDFLARED_SERVICE="cloudflared-tunnel"
 
-STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/clawhole/.watchdog"
+STATE_DIR="${CLOUDFLARED_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/cloudflared/.watchdog}"
 mkdir -p "$STATE_DIR"
 FAIL_FILE="$STATE_DIR/consecutive_failures"
 LAST_REQ_FILE="$STATE_DIR/last_total_requests"
 LAST_REQ_TIME_FILE="$STATE_DIR/last_req_change_time"
 LOCK_FILE="$STATE_DIR/watchdog.lock"
 
-LOG_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/clawhole/logs/tunnel-watchdog.log"
+LOG_FILE="${CLOUDFLARED_WATCHDOG_LOG:-${XDG_STATE_HOME:-$HOME/.local/state}/cloudflared/logs/watchdog.log}"
 mkdir -p "$(dirname "$LOG_FILE")"
 if [ -f "$LOG_FILE" ]; then
   SIZE=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
@@ -1092,18 +1077,6 @@ if [ -n "$TOTAL_REQ" ] && [[ "$TOTAL_REQ" =~ ^[0-9]+$ ]]; then
 fi
 
 record_success
-
-# Periodic origin check
-if [ $((RANDOM % 3)) -eq 0 ]; then
-  ORIGIN_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$ORIGIN_URL" 2>/dev/null) || ORIGIN_CODE="000"
-  if [ "$ORIGIN_CODE" = "000" ]; then
-    log "WARN: origin unreachable at $ORIGIN_URL"
-    if ! systemctl is-active --quiet openclaw-gateway; then
-      log "INFO: gateway not running, starting..."
-      systemctl start openclaw-gateway 2>/dev/null || true
-    fi
-  fi
-fi
 
 ERRS=$(get_metric "$METRICS" "cloudflared_tunnel_request_errors")
 EDGES=$(echo "$METRICS" | grep 'cloudflared_tunnel_server_locations' 2>/dev/null \
