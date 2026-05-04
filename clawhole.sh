@@ -73,7 +73,7 @@ set -o pipefail
 # ============================================================
 # 全局常量
 # ============================================================
-readonly SCRIPT_VERSION="4.4.0"
+readonly SCRIPT_VERSION="4.4.1"
 readonly SCRIPT_NAME="clawhole.sh"
 readonly DEFAULT_PORT=10371
 # FIX-F: TUNNEL_NAME 在 main() 中根据 DOMAIN 动态设置，支持多实例
@@ -239,14 +239,11 @@ json_field() {
     if command -v jq &>/dev/null; then
         echo "$json" | jq -r "$field" 2>/dev/null
     elif command -v python3 &>/dev/null; then
-        local py_keys
-        py_keys=$(echo "$field" | sed 's/^\.//' | sed "s/\./']['/g")
         echo "$json" | python3 -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
-    keys = '${py_keys}'.split(\"']['\")
-    for k in keys:
+    for k in '${field}'.lstrip('.').split('.'):
         d = d[k]
     print(d if d is not None else '')
 except Exception:
@@ -313,7 +310,7 @@ oc_set_token() {
     fi
     local tmpf
     tmpf=$(mktemp) || error "无法创建临时文件"
-    trap 'rm -f "$tmpf"' RETURN
+    trap 'rm -f "$tmpf"' EXIT
     chmod 600 "$tmpf"
     printf '%s' "$token" > "$tmpf"
     if openclaw config set gateway.auth.token --file "$tmpf" >> "$LOG_FILE" 2>&1; then
@@ -708,7 +705,7 @@ EOF
 MIN_HA_CONN=${MIN_HA_CONN:-2}
 METRICS_URL="http://127.0.0.1:2000/metrics"
 METRICS_TIMEOUT=10
-ORIGIN_URL=${ORIGIN_URL:-"http://127.0.0.1:18789/health"}
+ORIGIN_URL=${ORIGIN_URL:-"http://127.0.0.1:${OC_GATEWAY_PORT:-10371}/health"}
 FAIL_THRESHOLD=${FAIL_THRESHOLD:-3}
 STALE_MAX_SECONDS=${STALE_MAX_SECONDS:-600}
 CLOUDFLARED_LABEL="gui/$(id -u)/com.cloudflare.cloudflared"
@@ -988,7 +985,7 @@ EOF
 MIN_HA_CONN=${MIN_HA_CONN:-2}
 METRICS_URL="http://127.0.0.1:2000/metrics"
 METRICS_TIMEOUT=10
-ORIGIN_URL=${ORIGIN_URL:-"http://127.0.0.1:18789/health"}
+ORIGIN_URL=${ORIGIN_URL:-"http://127.0.0.1:${OC_GATEWAY_PORT:-10371}/health"}
 FAIL_THRESHOLD=${FAIL_THRESHOLD:-3}
 STALE_MAX_SECONDS=${STALE_MAX_SECONDS:-600}
 CLOUDFLARED_SERVICE="cloudflared-tunnel"
@@ -1138,13 +1135,28 @@ WantedBy=timers.target
 EOF
 
     # 每日条件性检查（04:00）：只在检测到问题时重启
+    local daily_restart_script="$OC_CONFIG_DIR/tunnel-daily-check-linux.sh"
+    cat > "$daily_restart_script" <<'DAILYLINUX'
+#!/bin/bash
+# Conditional daily restart (Linux) — only restart if tunnel is unhealthy
+HA_CONN=$(curl -sf --max-time 10 http://127.0.0.1:2000/metrics 2>/dev/null \
+  | grep '^cloudflared_tunnel_ha_connections ' 2>/dev/null | awk '{print $2}')
+if [ -z "$HA_CONN" ] || ! [[ "$HA_CONN" =~ ^[0-9]+$ ]] || [ "$HA_CONN" -lt 2 ]; then
+  echo "[$(date)] daily check: unhealthy (ha=${HA_CONN:-unreachable}), restarting"
+  systemctl restart cloudflared-tunnel 2>/dev/null || true
+else
+  echo "[$(date)] daily check: healthy (ha=$HA_CONN), no restart needed"
+fi
+DAILYLINUX
+    chmod +x "$daily_restart_script"
+
     sudo tee /etc/systemd/system/clawhole-daily-restart.service > /dev/null <<EOF
 [Unit]
 Description=ClawHole Daily cloudflared Check
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c 'HA_CONN=$(curl -sf --max-time 10 http://127.0.0.1:2000/metrics 2>/dev/null | grep "^cloudflared_tunnel_ha_connections " | awk "{print \$2}"); if [ -z "$HA_CONN" ] || [ "$HA_CONN" -lt 2 ] 2>/dev/null; then echo "daily check: unhealthy, restarting"; systemctl restart cloudflared-tunnel; else echo "daily check: healthy (ha=$HA_CONN)"; fi'
+ExecStart=$daily_restart_script
 EOF
 
     sudo tee /etc/systemd/system/clawhole-daily-restart.timer > /dev/null <<EOF
@@ -1415,7 +1427,8 @@ ingress:
       keepAliveConnections: 100
       keepAliveTimeout: 90s
       retries: 8
-      gracePeriod: 10s  - service: http_status:404
+      gracePeriod: 10s
+  - service: http_status:404
 
 logfile: $CF_CONFIG_DIR/tunnel.log
 loglevel: info
@@ -1552,11 +1565,12 @@ ingress:
       keepAliveConnections: 100
       keepAliveTimeout: 90s
       retries: 8
-      gracePeriod: 10s      access:
-        required: true
-        teamName: "${CF_TEAM_NAME}.cloudflareaccess.com"
-        audTag:
-          - "$app_aud"
+      gracePeriod: 10s
+    access:
+      required: true
+      teamName: "${CF_TEAM_NAME}.cloudflareaccess.com"
+      audTag:
+        - "$app_aud"
   - service: http_status:404
 
 logfile: $CF_CONFIG_DIR/tunnel.log
